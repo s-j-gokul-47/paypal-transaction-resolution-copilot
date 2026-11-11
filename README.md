@@ -8,7 +8,7 @@ A full-stack transaction resolution copilot for support agents and merchants. Bu
 
 - **Record-Grounded Transaction Explanations** — Explains `COMPLETED`, `PENDING`, `FAILED`, `DISPUTED`, and `REFUNDED` states strictly from verified database, PayPal API, and webhook evidence. Returns deterministic `source_evidence` alongside `mode` (`heuristic` by default; optional `openai` rewrite layer) and explicitly discloses unavailable fields instead of guessing unrecorded reasons or outcomes.
 - **Payment Event Timelines** — Tracks and displays real timestamped events (`TransactionEvent` table) updated by seed data, Sandbox captures, partial/full refunds, dispute actions, and verified webhooks.
-- **Duplicate Payment Detection** — Detects matching transactions within a 24-hour window (`buyer_email`, `merchant_id`, `amount`, `currency`) and distinguishes active `POSSIBLE_DUPLICATE` captures from `RETRY_AFTER_FAILURE` and `ALREADY_REFUNDED`.
+- **Order-Aware Duplicate Detection & Side-by-Side Investigation** — Detects matching transactions within a 24-hour window (`buyer_email`, `merchant_id`, `amount`, `currency`), classifies order relationships (`EXACT_MATCH`, conservative `POSSIBLE_RETRY_VARIANT`, `SEPARATE_ORDERS`) alongside `RETRY_AFTER_FAILURE` and `ALREADY_REFUNDED`, displays canonical `ORIGINAL` vs `EXTRA_CANDIDATE` records side by side, persists human review decisions (`CONFIRMED_DUPLICATE` / `SEPARATE_ORDERS`) with required-reason overrides and decision history/audit events, suppresses alerts for `SEPARATE_ORDERS` while keeping candidates accessible, and never executes automatic refunds.
 - **Support Summary Preparation** — Generates copy-ready **Internal Support Notes**, **Buyer Replies**, and **Escalation Briefs** strictly from verified transaction records and `verified_facts`.
 - **PayPal Sandbox Integration & Mock Distinction** — Supports real PayPal Sandbox OAuth2, Orders v2 create/capture (`POST /api/paypal/orders`, `/capture`), capture sync (`/api/paypal/sync/{capture_id}`), and full/partial capture refunds (`POST /api/transactions/{id}/refund`). In mock mode, responses are explicitly tagged (`mode: "mock"`, `is_simulated: true`, `warning: ...`) and unknown IDs return `404`.
 - **Hardened PayPal Webhook Verification & Reconciliation** — Preserves exact raw request bytes verbatim when delegating signature checks to PayPal's `POST /v1/notifications/verify-webhook-signature` API, deduplicates by both PayPal event ID and `refund_id`, handles `PAYMENT.CAPTURE.PENDING` and `PAYMENT.CAPTURE.REVERSED`, reconciles partial vs full refunds without double-counting, and rejects out-of-order stale status overwrites (`WEBHOOK_STALE_IGNORED`).
@@ -112,6 +112,8 @@ Copy `.env.example` to `backend/.env`. Leave PayPal and OpenAI keys as placehold
 | `GET` | `/api/transactions/{id}/resolution` | Complete resolution bundle (record, timeline, duplicates, explanation, disputes) |
 | `GET` | `/api/transactions/{id}/timeline` | Verified payment event timeline |
 | `GET` | `/api/transactions/{id}/duplicates` | Duplicate/retry detection results |
+| `GET` | `/api/transactions/{id}/duplicates/{other_id}/investigation` | Side-by-side duplicate pair comparison, roles, and review state |
+| `POST` | `/api/transactions/{id}/duplicates/{other_id}/review` | Submit or override human review decision (`CONFIRMED_DUPLICATE` / `SEPARATE_ORDERS`) without auto-refund |
 | `POST` | `/api/transactions/{id}/explain` | Record-grounded transaction state explanation |
 | `POST` | `/api/transactions/{id}/support-summary` | Generate copy-ready support summary (`buyer` / `internal` / `escalation`) |
 | `POST` | `/api/transactions/{id}/refund` | Issue full or partial refund via PayPal API (or tagged mock) & reconcile metadata/timeline |
@@ -146,7 +148,7 @@ Copy `.env.example` to `backend/.env`. Leave PayPal and OpenAI keys as placehold
 ### Running Automated Tests & Production Build
 
 ```powershell
-# Backend test suite (25 tests: webhooks, grounding, OpenAI adversarial/fallback)
+# Backend test suite (39 tests: duplicate detection, duplicate investigation, webhooks, grounding, OpenAI adversarial/fallback)
 cd d:\paypal-transaction-resolution-copilot\backend
 .\venv\Scripts\python.exe -m unittest discover -s tests -t . -v
 
@@ -160,7 +162,9 @@ npm run build
 - **Verified live against PayPal Sandbox:**
   - OAuth2 authentication, Orders v2 creation & buyer checkout approval, capture storage, full capture refund, and partial capture refund (`remaining_refundable` tracking and over-refund `422` guard).
   - Live webhook delivery via HTTPS tunnel (`PAYMENT.CAPTURE.COMPLETED` and `PAYMENT.CAPTURE.REFUNDED`), signature verification via PayPal's `/v1/notifications/verify-webhook-signature` API with exact raw request bytes, SQLite persistence (`webhook_events` + `transaction_events`), replay deduplication (`"reason": "duplicate"`), and tampered-payload rejection (`401`).
-- **Verified in automated tests (`25` passing tests in `backend/tests/`):**
+- **Verified in automated tests (`39` passing tests in `backend/tests/`):**
+  - `test_duplicate_detection.py`: Order-aware duplicate classification (`EXACT_MATCH`, conservative `POSSIBLE_RETRY_VARIANT`, `SEPARATE_ORDERS` retention + alert suppression), status-aware wording for `PENDING`/`DISPUTED`/`FAILED`, `order_id` preservation on Sandbox sync and webhooks, and zero automatic refunds.
+  - `test_duplicate_investigation.py`: Canonical pair uniqueness across forward/reverse URLs and timestamp ties, self-pair/alias/missing-ID validation (`422`/`404`), `409` duplicate-decision & concurrency safety, required `override_reason` with preserved `decision_history`, dual `DUPLICATE_REVIEWED` audit events, unverified reviewer flag enforcement, `SEPARATE_ORDERS` alert suppression, and refund isolation.
   - `test_webhooks.py`: Raw-body byte preservation, `PAYMENT.CAPTURE.PENDING` & `PAYMENT.CAPTURE.REVERSED`, out-of-order stale webhook preservation, cross-event `refund_id` deduplication, concurrent duplicate delivery safety, retry on transient handler failure, and malformed/unhandled event handling *(uses isolated SQLite DBs and mocked PayPal API responses for local webhook replay/reversal/stale cases)*.
   - `test_heuristic_grounding.py`: All 8 heuristic grounding scenarios (`COMPLETED`, `PENDING`, full refund, partial refund, duplicate webhook, stale webhook, `DISPUTED` status/evidence disclosure, and missing transaction fields).
   - `test_openai_adversarial.py`: Missing/invalid API key fallback, timeout & `429` rate-limit fallback, partial refund figure enforcement, dispute/missing-evidence hallucination guards, prompt-injection resistance, and read-only DB safety *(uses mocked OpenAI completions/errors)*.

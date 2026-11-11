@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Optional
 
 from models import AIRecommendationResponse
-from status_engine import StatusEngine
+from status_engine import StatusEngine, get_refund_summary
 
 
 # ---------------------------------------------------------------------------
@@ -158,50 +158,75 @@ def _build_heuristic_support_summary(
     audience: str,
     agent_notes: Optional[str],
 ) -> str:
-    pp_id = transaction_data.get("paypal_transaction_id", "N/A")
-    amount = float(transaction_data.get("amount", 0) or 0)
-    currency = transaction_data.get("currency", "USD")
-    status = transaction_data.get("status", "UNKNOWN")
+    pp_id = transaction_data.get("paypal_transaction_id") or "Unavailable"
+    raw_amount = transaction_data.get("amount")
+    has_amount = raw_amount is not None
+    amount = float(raw_amount) if has_amount else 0.0
+    currency = transaction_data.get("currency") or "USD"
+    amount_text = f"{amount:.2f} {currency}" if has_amount else "Unavailable"
+    status = (transaction_data.get("status") or "UNKNOWN").upper()
     buyer = transaction_data.get("buyer_email") or "Not recorded"
     created_at = transaction_data.get("created_at") or "Not recorded"
-    metadata = transaction_data.get("metadata") or {}
-    order_id = metadata.get("order_id")
+    metadata = transaction_data.get("metadata") or transaction_data.get("metadata_") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    order_id = metadata.get("order_id") or metadata.get("paypal_order_id")
     error_code = metadata.get("error_code")
+    pending_reason = metadata.get("pending_reason")
 
+    total_refunded, remaining_refundable, _ = (
+        get_refund_summary(amount, status, metadata) if has_amount else (0.0, 0.0, [])
+    )
+    stale_events = [
+        ev for ev in timeline_events if (ev.get("event_type") or "").upper() == "WEBHOOK_STALE_IGNORED"
+    ]
     active_dups = [d for d in duplicate_candidates if d.get("classification") == "POSSIBLE_DUPLICATE"]
     retry_dups = [d for d in duplicate_candidates if d.get("classification") == "RETRY_AFTER_FAILURE"]
 
     if audience == "buyer":
         lines = [
-            f"Hello,",
+            "Hello,",
             "",
-            f"Here is the verified status update for your PayPal transaction {pp_id} ({amount:.2f} {currency}):",
+            f"Here is the verified status update for your PayPal transaction {pp_id} ({amount_text}):",
             f"- Current Status: {status}",
             f"- Recorded Date (UTC): {created_at}",
         ]
         if order_id:
             lines.append(f"- Order Reference: {order_id}")
         if status == "COMPLETED":
-            total_refunded = float(metadata.get("total_refunded") or 0.0)
-            if metadata.get("partial_refund") and total_refunded > 0:
+            if (metadata.get("partial_refund") or (has_amount and total_refunded > 0)):
                 lines.append(
                     f"- Details: Your payment was captured, and a partial refund of "
-                    f"{total_refunded:.2f} {currency} has been processed."
+                    f"{total_refunded:.2f} {currency} has been processed "
+                    f"({remaining_refundable:.2f} {currency} remaining)."
                 )
             else:
                 lines.append("- Details: Your payment has been captured and settled.")
         elif status == "PENDING":
-            lines.append("- Details: Your payment is currently pending final settlement/clearing.")
+            lines.append(
+                "- Details: Your payment is currently pending settlement"
+                + (f" (reason: {pending_reason})" if pending_reason else " (specific reason not recorded)")
+                + " and has not completed yet."
+            )
         elif status == "FAILED":
             lines.append(
-                f"- Details: This payment attempt did not succeed"
-                + (f" (reason: {error_code})" if error_code else "")
+                "- Details: This payment attempt did not succeed"
+                + (f" (reason: {error_code})" if error_code else " (specific error code not recorded)")
                 + ", so no funds were settled for it."
             )
         elif status == "REFUNDED":
-            lines.append("- Details: A refund has been processed for this transaction.")
+            refund_line = (
+                f"{total_refunded:.2f} {currency} refunded; {remaining_refundable:.2f} {currency} remaining"
+                if has_amount
+                else "refund recorded (amount unavailable)"
+            )
+            lines.append(f"- Details: A refund has been processed ({refund_line}).")
         elif status == "DISPUTED":
-            lines.append("- Details: This transaction currently has an active dispute under review.")
+            if disputes:
+                statuses = ", ".join((d.get("status") or "UNKNOWN") for d in disputes)
+                lines.append(f"- Details: This transaction currently has a linked dispute ({statuses}).")
+            else:
+                lines.append("- Details: This transaction is marked DISPUTED (dispute details unavailable locally).")
 
         if active_dups:
             lines.append(
@@ -220,7 +245,7 @@ def _build_heuristic_support_summary(
     if audience == "escalation":
         lines = [
             f"ESCALATION BRIEF — {pp_id}",
-            f"Status: {status} | Amount: {amount:.2f} {currency} | Buyer: {buyer}",
+            f"Status: {status} | Amount: {amount_text} | Buyer: {buyer}",
             f"Created (UTC): {created_at}",
             f"Metadata: {json.dumps(metadata)}" if metadata else "Metadata: None recorded",
             "",
@@ -230,6 +255,8 @@ def _build_heuristic_support_summary(
             lines.append(f"  * [{ev.get('occurred_at')}] {ev.get('title')}: {ev.get('description') or ''}")
         if not timeline_events:
             lines.append("  * No timeline events recorded.")
+        if stale_events:
+            lines.append(f"  * Stale/out-of-order webhooks ignored: {len(stale_events)}")
         lines.extend([
             "",
             f"Duplicate Check: {len(duplicate_candidates)} related transaction(s) flagged.",
@@ -240,7 +267,12 @@ def _build_heuristic_support_summary(
             lines.append("")
             lines.append("Linked Disputes:")
             for d in disputes:
-                lines.append(f"  * {d.get('paypal_dispute_id') or d.get('id')} — {d.get('status')} ({d.get('reason')})")
+                ev_flag = "evidence submitted" if d.get("evidence_submitted") else "evidence not submitted"
+                lines.append(
+                    f"  * {d.get('paypal_dispute_id') or d.get('id')} — {d.get('status')} ({d.get('reason')}, {ev_flag})"
+                )
+        elif status == "DISPUTED":
+            lines.extend(["", "Linked Disputes: Unavailable in local database."])
         if agent_notes:
             lines.extend(["", f"Agent Notes: {agent_notes}"])
         return "\n".join(lines)
@@ -249,21 +281,28 @@ def _build_heuristic_support_summary(
     lines = [
         f"Support Summary — {pp_id}",
         f"- Verified Status: {status}",
-        f"- Amount: {amount:.2f} {currency}",
+        f"- Amount: {amount_text}",
         f"- Buyer: {buyer}",
         f"- Recorded At (UTC): {created_at}",
     ]
     if order_id:
         lines.append(f"- Order ID: {order_id}")
-    if metadata.get("partial_refund") and float(metadata.get("total_refunded") or 0.0) > 0:
-        lines.append(
-            f"- Partial Refund Recorded: {float(metadata.get('total_refunded') or 0.0):.2f} {currency} "
-            f"(remaining refundable: {float(metadata.get('remaining_refundable') or 0.0):.2f} {currency})"
-        )
+    if total_refunded > 0 or status == "REFUNDED":
+        if has_amount:
+            lines.append(
+                f"- Refund Accounting: {total_refunded:.2f} {currency} refunded; "
+                f"{remaining_refundable:.2f} {currency} remaining refundable"
+            )
+    if pending_reason:
+        lines.append(f"- Pending Reason: {pending_reason}")
     if error_code:
         lines.append(f"- Processor Error Code: {error_code}")
     if timeline_events:
         lines.append(f"- Timeline Events ({len(timeline_events)}): latest = {timeline_events[-1].get('title')} at {timeline_events[-1].get('occurred_at')}")
+    else:
+        lines.append("- Timeline Events: Unavailable (0 recorded events)")
+    if stale_events:
+        lines.append(f"- Out-of-order Webhooks Ignored: {len(stale_events)} (preserved {status})")
     if active_dups:
         lines.append(
             f"- Duplicate Alert: {len(active_dups)} possible duplicate(s) ({', '.join(d['paypal_transaction_id'] for d in active_dups)})"
@@ -271,7 +310,13 @@ def _build_heuristic_support_summary(
     else:
         lines.append("- Duplicate Alert: No active duplicate charges detected.")
     if disputes:
-        lines.append(f"- Linked Disputes: {len(disputes)} ({', '.join(d.get('status', '') for d in disputes)})")
+        dispute_notes = ", ".join(
+            f"{d.get('status', 'UNKNOWN')} ({'evidence submitted' if d.get('evidence_submitted') else 'no evidence submitted'})"
+            for d in disputes
+        )
+        lines.append(f"- Linked Disputes ({len(disputes)}): {dispute_notes}")
+    elif status == "DISPUTED":
+        lines.append("- Linked Disputes: Unavailable in local database")
     if agent_notes:
         lines.append(f"- Agent Notes: {agent_notes}")
     return "\n".join(lines)

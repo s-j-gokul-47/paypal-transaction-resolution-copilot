@@ -387,48 +387,132 @@ class StatusEngine:
     ) -> dict:
         """
         Produce a grounded explanation of a transaction's current state using
-        only fields present in the verified DB/API record.
+        only fields present in the verified DB/API record, explicitly disclosing
+        any unavailable data without guessing unrecorded causes or outcomes.
         """
-        txn_id = _get_attr(txn, "id")
-        pp_id = _get_attr(txn, "paypal_transaction_id")
-        status = (_get_attr(txn, "status") or "UNKNOWN").upper()
-        amount = float(_get_attr(txn, "amount") or 0)
-        currency = _get_attr(txn, "currency") or "USD"
+        txn_id = str(_get_attr(txn, "id") or "")
+        raw_pp_id = _get_attr(txn, "paypal_transaction_id")
+        pp_id = str(raw_pp_id).strip() if raw_pp_id else "UNAVAILABLE"
+
+        raw_status = _get_attr(txn, "status")
+        status = str(raw_status).strip().upper() if raw_status else "UNKNOWN"
+
+        raw_amount = _get_attr(txn, "amount")
+        has_amount = raw_amount is not None
+        amount = float(raw_amount) if has_amount else 0.0
+
+        raw_currency = _get_attr(txn, "currency")
+        currency = str(raw_currency).strip().upper() if raw_currency else ""
+        amount_phrase = (
+            f"{amount:.2f} {currency or 'currency-unrecorded'}"
+            if has_amount
+            else "unavailable amount"
+        )
+
         metadata = _get_attr(txn, "metadata_") or _get_attr(txn, "metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
 
-        verified_fields = ["paypal_transaction_id", "status", "amount", "currency", "created_at", "updated_at"]
+        buyer_email = _get_attr(txn, "buyer_email")
+        created_at = _get_attr(txn, "created_at")
+        updated_at = _get_attr(txn, "updated_at")
+        order_id = metadata.get("order_id") or metadata.get("paypal_order_id")
         error_code = metadata.get("error_code")
         expected_ship = metadata.get("expected_ship")
-        order_id = metadata.get("order_id")
-        if error_code:
-            verified_fields.append("metadata.error_code")
-        if expected_ship:
-            verified_fields.append("metadata.expected_ship")
+        pending_reason = metadata.get("pending_reason") or (
+            ((metadata.get("paypal_capture") or {}).get("status_details") or {}).get("reason")
+            if isinstance(metadata.get("paypal_capture"), dict)
+            else None
+        )
+
+        verified_fields: list[str] = []
+        unavailable_fields: list[str] = []
+
+        if raw_pp_id:
+            verified_fields.append("paypal_transaction_id")
+        else:
+            unavailable_fields.append("paypal_transaction_id")
+
+        if raw_status and status != "UNKNOWN":
+            verified_fields.append("status")
+        else:
+            unavailable_fields.append("status")
+
+        if has_amount:
+            verified_fields.append("amount")
+        else:
+            unavailable_fields.append("amount")
+
+        if currency:
+            verified_fields.append("currency")
+        else:
+            unavailable_fields.append("currency")
+
+        if created_at:
+            verified_fields.append("created_at")
+        else:
+            unavailable_fields.append("created_at")
+
+        if updated_at:
+            verified_fields.append("updated_at")
+
+        if buyer_email:
+            verified_fields.append("buyer_email")
+        else:
+            unavailable_fields.append("buyer_email")
+
         if order_id:
             verified_fields.append("metadata.order_id")
+        if error_code:
+            verified_fields.append("metadata.error_code")
+        if pending_reason:
+            verified_fields.append("metadata.pending_reason")
+        if expected_ship:
+            verified_fields.append("metadata.expected_ship")
+
         if timeline_events:
             verified_fields.append(f"timeline_events({len(timeline_events)})")
+        else:
+            unavailable_fields.append("timeline_events")
+
         if duplicate_candidates:
             verified_fields.append(f"duplicate_candidates({len(duplicate_candidates)})")
         if disputes:
             verified_fields.append(f"disputes({len(disputes)})")
 
+        stale_events = [
+            ev
+            for ev in timeline_events
+            if (ev.get("event_type") or "").upper() == "WEBHOOK_STALE_IGNORED"
+        ]
+        if stale_events:
+            verified_fields.append(f"stale_webhook_events({len(stale_events)})")
+
         active_dups = [d for d in duplicate_candidates if d["classification"] == "POSSIBLE_DUPLICATE"]
+        total_refunded, remaining, refund_entries = (
+            get_refund_summary(amount, status, metadata)
+            if has_amount
+            else (0.0, 0.0, list(metadata.get("refunds") or []))
+        )
+        refund_ids = [r.get("refund_id") for r in refund_entries if r.get("refund_id")]
+        if not refund_ids and metadata.get("refund_id"):
+            refund_ids = [metadata["refund_id"]]
+        if refund_entries or metadata.get("total_refunded") is not None or metadata.get("refund_id"):
+            verified_fields.append("metadata.refunds")
 
         if status == "COMPLETED":
-            partial_refund = bool(metadata.get("partial_refund"))
-            total_refunded = float(metadata.get("total_refunded") or 0.0)
-            remaining = float(metadata.get("remaining_refundable") or max(0.0, amount - total_refunded))
-            if partial_refund and total_refunded > 0:
+            is_partial = bool(metadata.get("partial_refund")) or (has_amount and 0 < total_refunded < amount - 0.005)
+            if is_partial and total_refunded > 0:
                 headline = "Payment captured with partial refund recorded"
                 summary = (
-                    f"Transaction {pp_id} for {amount:.2f} {currency} is COMPLETED with "
+                    f"Transaction {pp_id} for {amount_phrase} is COMPLETED with "
                     f"{total_refunded:.2f} {currency} partially refunded "
                     f"({remaining:.2f} {currency} remaining refundable)."
                 )
-                causes = ["Capture completed and one or more partial refunds were recorded."]
+                causes = [
+                    f"Capture status is COMPLETED; recorded refund(s) total {total_refunded:.2f} {currency}"
+                    + (f" (refund ID(s): {', '.join(refund_ids)})." if refund_ids else ".")
+                ]
                 actions = [
                     f"Only up to {remaining:.2f} {currency} remains refundable on this capture.",
                     "Review timeline events for confirmed partial refund IDs before issuing another refund.",
@@ -436,30 +520,38 @@ class StatusEngine:
             else:
                 headline = "Payment captured and settled"
                 summary = (
-                    f"Transaction {pp_id} for {amount:.2f} {currency} is recorded as COMPLETED"
+                    f"Transaction {pp_id} for {amount_phrase} is recorded as COMPLETED"
                     + (f" for order {order_id}." if order_id else ".")
-                    + " Funds were captured."
                 )
-                causes = ["Authorization and capture completed normally."]
+                causes = (
+                    ["Stored transaction status is COMPLETED and payment timeline events are recorded."]
+                    if timeline_events
+                    else ["Stored transaction status is COMPLETED (no payment timeline events recorded yet)."]
+                )
                 actions = [
                     "No payment recovery needed unless buyer reports an issue.",
                     "Issue a refund from this screen if order cancellation or duplicate charge is confirmed.",
                 ]
         elif status == "PENDING":
             headline = "Payment is pending settlement or release"
+            pending_details = []
+            if pending_reason:
+                pending_details.append(f"pending_reason={pending_reason}")
+            if expected_ship:
+                pending_details.append(f"expected_ship={expected_ship}")
+            detail_clause = f" ({', '.join(pending_details)})" if pending_details else ""
             summary = (
-                f"Transaction {pp_id} for {amount:.2f} {currency} is currently PENDING"
-                + (f" (metadata lists expected_ship={expected_ship})." if expected_ship else ".")
-                + " Settlement has not yet finalized."
+                f"Transaction {pp_id} for {amount_phrase} is currently PENDING{detail_clause}. "
+                "Payment has not succeeded or settled yet."
             )
-            causes = [
-                "Funding source clearing delay (e.g., eCheck/bank transfer) or uncaptured authorization.",
-                *(
-                    [f"Pre-order / deferred fulfillment recorded (expected_ship: {expected_ship})."]
-                    if expected_ship
-                    else []
-                ),
-            ]
+            causes = []
+            if pending_reason:
+                causes.append(f"Recorded pending reason: {pending_reason}.")
+            if expected_ship:
+                causes.append(f"Deferred fulfillment / expected_ship recorded: {expected_ship}.")
+            if not pending_reason and not expected_ship:
+                unavailable_fields.append("metadata.pending_reason")
+                causes.append("Specific pending reason is unavailable (not recorded in metadata).")
             actions = [
                 "Do not fulfill high-value goods until status transitions to COMPLETED.",
                 "Monitor incoming PayPal PAYMENT.CAPTURE.COMPLETED webhooks or refresh capture status.",
@@ -467,46 +559,96 @@ class StatusEngine:
         elif status == "FAILED":
             headline = f"Payment failed{f' ({error_code})' if error_code else ''}"
             summary = (
-                f"Transaction {pp_id} for {amount:.2f} {currency} is marked FAILED"
+                f"Transaction {pp_id} for {amount_phrase} is marked FAILED"
                 + (f" with recorded error_code={error_code}." if error_code else ".")
                 + " No funds were settled for this attempt."
             )
-            causes = (
-                [f"Recorded processor error code: {error_code}."]
-                if error_code
-                else ["Payment authorization or funding check was declined."]
-            )
+            if error_code:
+                causes = [f"Recorded processor error code: {error_code}."]
+            else:
+                unavailable_fields.append("metadata.error_code")
+                causes = ["Specific processor failure reason is unavailable (no error_code recorded in metadata)."]
             actions = [
                 "Ask the buyer to verify their funding method or retry checkout.",
                 "Check if a subsequent COMPLETED transaction exists before asking the buyer to pay again.",
             ]
         elif status == "DISPUTED":
-            dispute_reasons = ", ".join(d.get("reason", "UNKNOWN") for d in disputes) or "dispute recorded"
-            headline = "Payment is on hold due to an open/active dispute"
-            summary = (
-                f"Transaction {pp_id} for {amount:.2f} {currency} is DISPUTED "
-                f"({len(disputes)} linked dispute record(s): {dispute_reasons})."
-            )
-            causes = [f"Buyer opened a PayPal dispute ({dispute_reasons})."]
+            if disputes:
+                dispute_summaries = []
+                any_open = any((d.get("status") or "").upper() == "OPEN" for d in disputes)
+                headline = (
+                    "Payment is on hold due to an open dispute"
+                    if any_open
+                    else "Payment has an active/recorded dispute"
+                )
+                for d in disputes:
+                    d_ref = d.get("paypal_dispute_id") or d.get("id") or "unnumbered"
+                    d_status = (d.get("status") or "UNKNOWN").upper()
+                    d_reason = d.get("reason") or "UNSPECIFIED"
+                    ev_text = "evidence submitted" if d.get("evidence_submitted") else "evidence not submitted"
+                    res_text = f", outcome={d['resolution']}" if d.get("resolution") else ""
+                    dispute_summaries.append(f"{d_ref} [{d_status}, {d_reason}, {ev_text}{res_text}]")
+                joined = "; ".join(dispute_summaries)
+                summary = (
+                    f"Transaction {pp_id} for {amount_phrase} is DISPUTED "
+                    f"({len(disputes)} linked dispute record(s): {joined})."
+                )
+                causes = [f"Linked dispute record(s): {joined}."]
+            else:
+                unavailable_fields.append("dispute_records")
+                headline = "Payment is marked DISPUTED (dispute details unavailable)"
+                summary = (
+                    f"Transaction {pp_id} for {amount_phrase} is marked DISPUTED, "
+                    "but linked dispute status, reason, and evidence records are unavailable in the local database."
+                )
+                causes = ["Transaction status is DISPUTED, while specific dispute details are unavailable locally."]
             actions = [
-                "Review linked dispute evidence/status before shipping or issuing an ad-hoc refund.",
+                "Review linked dispute status and evidence state before shipping or issuing an ad-hoc refund.",
                 "Respond via the Disputes tab (submit tracking/evidence or accept claim).",
             ]
         elif status == "REFUNDED":
             headline = "Payment has been refunded"
-            summary = (
-                f"Transaction {pp_id} for {amount:.2f} {currency} is REFUNDED. "
-                "Funds have been returned to the buyer's funding source."
+            refund_desc = (
+                f"{total_refunded:.2f} {currency} refunded; {remaining:.2f} {currency} remaining refundable"
+                if has_amount
+                else "refunded amount unavailable because original transaction amount is missing"
             )
-            causes = ["Full refund recorded by merchant action, dispute acceptance, or webhook."]
+            id_clause = f" (refund ID(s): {', '.join(refund_ids)})" if refund_ids else ""
+            summary = f"Transaction {pp_id} for {amount_phrase} is REFUNDED ({refund_desc}){id_clause}."
+            causes = []
+            if refund_ids or any(
+                (ev.get("event_type") or "").upper() == "REFUND_ISSUED" for ev in timeline_events
+            ):
+                causes.append(
+                    f"Refund/reversal recorded for {total_refunded:.2f} {currency}"
+                    + (f" under ID(s) {', '.join(refund_ids)}." if refund_ids else ".")
+                )
+            else:
+                unavailable_fields.append("refund_reference")
+                causes.append("Transaction is marked REFUNDED, though specific refund ID/timeline reference is unavailable.")
             actions = [
-                "Provide the refund transaction timeline and ID to the buyer if they inquire about bank posting times (typically 3–5 business days for cards).",
+                "Provide the verified refund timeline and ID (if recorded) to the buyer if they ask about posting times.",
             ]
         else:
             headline = f"Recorded status: {status}"
-            summary = f"Transaction {pp_id} has recorded status {status} for {amount:.2f} {currency}."
-            causes = ["Status recorded directly from database/API."]
+            summary = f"Transaction {pp_id} has recorded status {status} for {amount_phrase}."
+            causes = (
+                ["Status recorded directly from database/API."]
+                if status != "UNKNOWN"
+                else ["Transaction status is unavailable/UNKNOWN in the local record."]
+            )
             actions = ["Inspect raw metadata and PayPal lookup for additional details."]
+
+        if stale_events:
+            latest_stale = stale_events[-1].get("description") or stale_events[-1].get("title") or ""
+            summary += (
+                f" Note: {len(stale_events)} older/out-of-order webhook event(s) were ignored "
+                f"to preserve the newer {status} status."
+            )
+            causes.append(
+                f"{len(stale_events)} older/out-of-order webhook event(s) ignored"
+                + (f" (latest: {latest_stale})" if latest_stale else ".")
+            )
 
         if active_dups:
             summary += (
@@ -516,6 +658,15 @@ class StatusEngine:
                 0,
                 f"Review {len(active_dups)} possible duplicate charge(s) below before fulfilling or closing ticket.",
             )
+
+        # Deduplicate unavailable_fields preserving order and explicitly disclose missing data
+        dedup_unavailable = list(dict.fromkeys(unavailable_fields))
+        if dedup_unavailable:
+            summary += f" Unavailable record data: {', '.join(dedup_unavailable)}."
+            if any(f in {"paypal_transaction_id", "amount", "status", "dispute_records", "timeline_events"} for f in dedup_unavailable):
+                actions.append(
+                    f"Verify missing data ({', '.join(dedup_unavailable)}) via PayPal API lookup before final action."
+                )
 
         return {
             "transaction_id": txn_id,

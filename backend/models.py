@@ -3,14 +3,14 @@ models.py - SQLAlchemy ORM models and Pydantic schemas for PayPal Transaction Re
 """
 import uuid
 from datetime import datetime
-from typing import Optional, Any, List
+from typing import Optional, Any, List, Literal
 
 from sqlalchemy import (
     Column, String, Float, Boolean, Text, JSON, DateTime,
-    ForeignKey, Enum as SAEnum
+    ForeignKey, Enum as SAEnum, UniqueConstraint, CheckConstraint
 )
 from sqlalchemy.orm import relationship
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from database import Base
 
@@ -134,6 +134,48 @@ class WebhookEvent(Base):
     processed_at = Column(DateTime, nullable=True)
 
 
+class DuplicateReview(Base):
+    """
+    Persistent investigation state for an unordered pair of transactions.
+    `decision_history` is append-only by application convention (not tamper-proof).
+    """
+    __tablename__ = "duplicate_reviews"
+    __table_args__ = (
+        UniqueConstraint("pair_low_id", "pair_high_id", name="uq_duplicate_review_pair"),
+        CheckConstraint("pair_low_id < pair_high_id", name="ck_duplicate_review_distinct_pair"),
+    )
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    pair_low_id = Column(
+        String, ForeignKey("transactions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    pair_high_id = Column(
+        String, ForeignKey("transactions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    original_transaction_id = Column(
+        String, ForeignKey("transactions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    extra_transaction_id = Column(
+        String, ForeignKey("transactions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    decision = Column(
+        SAEnum(
+            "PENDING_REVIEW",
+            "CONFIRMED_DUPLICATE",
+            "SEPARATE_ORDERS",
+            name="duplicate_review_decision",
+        ),
+        nullable=False,
+        default="PENDING_REVIEW",
+    )
+    reviewer = Column(String, nullable=True)
+    reviewer_verified = Column(Boolean, nullable=False, default=False)
+    notes = Column(Text, nullable=True)
+    decision_history = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
 # ---------------------------------------------------------------------------
 # Pydantic Schemas
 # ---------------------------------------------------------------------------
@@ -221,12 +263,72 @@ class DuplicateCandidate(BaseModel):
     order_id: Optional[str] = None
     description: Optional[str] = None
     order_relationship: Optional[str] = None
+    role: Optional[str] = None
+    review_decision: str = "PENDING_REVIEW"
+    reviewer_verified: bool = False
 
 
 class DuplicateAnalysisResponse(BaseModel):
     transaction_id: str
     has_possible_duplicates: bool
     candidates: List[DuplicateCandidate]
+
+
+class DuplicateReviewRequest(BaseModel):
+    decision: Literal["CONFIRMED_DUPLICATE", "SEPARATE_ORDERS"]
+    reviewer: Optional[str] = None
+    notes: Optional[str] = None
+    override_reason: Optional[str] = None
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def _normalize_decision(cls, v):
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
+
+
+class DuplicateReviewResponse(BaseModel):
+    id: Optional[str] = None
+    pair_low_id: str
+    pair_high_id: str
+    original_transaction_id: str
+    extra_transaction_id: str
+    decision: str = "PENDING_REVIEW"
+    reviewer: Optional[str] = None
+    reviewer_verified: bool = False
+    notes: Optional[str] = None
+    decision_history: List[dict] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DuplicateSideBySideTransaction(BaseModel):
+    id: str
+    paypal_transaction_id: str
+    status: str
+    amount: float
+    currency: str
+    order_id: Optional[str] = None
+    description: Optional[str] = None
+    buyer_email: Optional[str] = None
+    merchant_id: str
+    created_at: datetime
+    total_refunded: float = 0.0
+    remaining_refundable: float = 0.0
+    role: str
+    refund_eligible: bool = False
+
+
+class DuplicateInvestigationResponse(BaseModel):
+    pair_low_id: str
+    pair_high_id: str
+    original_transaction: DuplicateSideBySideTransaction
+    extra_candidate: DuplicateSideBySideTransaction
+    comparison: dict
+    review: DuplicateReviewResponse
 
 
 class SupportSummaryRequest(BaseModel):

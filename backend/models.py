@@ -200,6 +200,7 @@ class TransactionStateExplanation(BaseModel):
     likely_causes: List[str]
     recommended_actions: List[str]
     verified_fields_used: List[str]
+    source_evidence: dict = Field(default_factory=dict)
     mode: str
     data_source: str = "database"
 

@@ -668,6 +668,38 @@ class StatusEngine:
                     f"Verify missing data ({', '.join(dedup_unavailable)}) via PayPal API lookup before final action."
                 )
 
+        source_evidence = {
+            "paypal_transaction_id": pp_id if raw_pp_id else None,
+            "status": status,
+            "amount": amount if has_amount else None,
+            "currency": currency or None,
+            "order_id": order_id,
+            "pending_reason": pending_reason,
+            "error_code": error_code,
+            "buyer_email_recorded": bool(buyer_email),
+            "total_refunded": total_refunded if (has_amount and (total_refunded > 0 or status == "REFUNDED")) else 0.0,
+            "remaining_refundable": remaining if has_amount else None,
+            "partial_refund": bool(
+                status == "COMPLETED" and has_amount and 0 < total_refunded < amount - 0.005
+            ),
+            "refund_ids": refund_ids,
+            "disputes": [
+                {
+                    "id": d.get("paypal_dispute_id") or d.get("id"),
+                    "status": (d.get("status") or "UNKNOWN").upper(),
+                    "reason": d.get("reason") or "UNSPECIFIED",
+                    "evidence_submitted": bool(d.get("evidence_submitted")),
+                    "resolution": d.get("resolution"),
+                }
+                for d in disputes
+            ],
+            "timeline_event_count": len(timeline_events),
+            "stale_webhooks_ignored": len(stale_events),
+            "possible_duplicate_count": len(active_dups),
+            "unavailable_fields": dedup_unavailable,
+            "verified_fields_used": verified_fields,
+        }
+
         return {
             "transaction_id": txn_id,
             "paypal_transaction_id": pp_id,
@@ -677,6 +709,7 @@ class StatusEngine:
             "likely_causes": causes,
             "recommended_actions": actions,
             "verified_fields_used": verified_fields,
+            "source_evidence": source_evidence,
             "mode": "heuristic",
             "data_source": "database",
         }

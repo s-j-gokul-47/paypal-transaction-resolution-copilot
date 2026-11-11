@@ -218,6 +218,9 @@ class DuplicateCandidate(BaseModel):
     matching_fields: List[str]
     explanation: str
     recommended_action: str
+    order_id: Optional[str] = None
+    description: Optional[str] = None
+    order_relationship: Optional[str] = None
 
 
 class DuplicateAnalysisResponse(BaseModel):

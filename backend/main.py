@@ -1412,14 +1412,25 @@ def _upsert_paypal_capture_in_db(
     txn = db.query(Transaction).filter(Transaction.paypal_transaction_id == capture_id).first()
     is_new = txn is None
 
+    resolved_order_id = (
+        (order_payload or {}).get("id")
+        or ((capture.get("supplementary_data") or {}).get("related_ids") or {}).get("order_id")
+        or ((txn.metadata_ or {}).get("paypal_order_id") if txn else None)
+        or ((txn.metadata_ or {}).get("order_id") if txn else None)
+    )
+
     metadata_payload = {
         "paypal_raw_status": raw_status,
-        "paypal_order_id": (order_payload or {}).get("id"),
         "paypal_capture": capture,
         "is_simulated": bool((order_payload or capture).get("is_simulated")),
     }
-    if (raw_status or "").upper() == "PARTIALLY_REFUNDED":
+    if resolved_order_id:
+        metadata_payload["paypal_order_id"] = resolved_order_id
+    raw_upper = (raw_status or "").upper()
+    if raw_upper == "PARTIALLY_REFUNDED":
         metadata_payload["partial_refund"] = True
+    elif raw_upper == "REFUNDED":
+        metadata_payload["partial_refund"] = False
 
     if is_new:
         txn = Transaction(
@@ -1445,7 +1456,7 @@ def _upsert_paypal_capture_in_db(
                 title=f"PayPal capture stored ({raw_status})",
                 description=f"Captured {amount:.2f} {currency} via PayPal ({capture.get('mode', paypal_service.environment_label)}).",
                 source=source,
-                details={"capture_id": capture_id, "order_id": (order_payload or {}).get("id")},
+                details={"capture_id": capture_id, "order_id": resolved_order_id},
                 occurred_at=now,
             )
         )

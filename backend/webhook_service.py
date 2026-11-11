@@ -445,6 +445,7 @@ class WebhookService:
         amount = float(amount_obj.get("value", 0) or 0)
         currency = amount_obj.get("currency_code", "USD")
         seller_email = resource.get("payee", {}).get("email_address") or None
+        pp_order_id = ((resource.get("supplementary_data") or {}).get("related_ids") or {}).get("order_id")
 
         existing = db.query(Transaction).filter(
             Transaction.paypal_transaction_id == capture_id
@@ -477,16 +478,28 @@ class WebhookService:
 
             existing.status = "COMPLETED"
             existing.updated_at = datetime.utcnow()
+            if pp_order_id:
+                meta = dict(existing.metadata_ or {})
+                if not meta.get("paypal_order_id") and not meta.get("order_id"):
+                    meta["paypal_order_id"] = pp_order_id
+                    existing.metadata_ = meta
             self._log_timeline_event(
                 db,
                 transaction_id=existing.id,
                 event_type="PAYMENT_CAPTURED",
                 title="Payment capture completed",
                 description=f"Webhook PAYMENT.CAPTURE.COMPLETED confirmed {amount:.2f} {currency}.",
-                details={"capture_id": capture_id},
+                details={"capture_id": capture_id, **({"order_id": pp_order_id} if pp_order_id else {})},
             )
             db.flush()
             return {"status": "updated", "transaction_id": existing.id}
+
+        new_meta = {
+            "paypal_raw_status": resource.get("status", "COMPLETED"),
+            "paypal_capture": resource,
+        }
+        if pp_order_id:
+            new_meta["paypal_order_id"] = pp_order_id
 
         new_txn = Transaction(
             id=str(uuid.uuid4()),
@@ -497,6 +510,7 @@ class WebhookService:
             status="COMPLETED",
             seller_email=seller_email,
             description="Payment capture completed via webhook",
+            metadata_=new_meta,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
@@ -565,9 +579,13 @@ class WebhookService:
 
         txn.status = "PENDING"
         txn.updated_at = datetime.utcnow()
-        if reason:
+        pp_order_id = ((resource.get("supplementary_data") or {}).get("related_ids") or {}).get("order_id")
+        if reason or pp_order_id:
             meta = dict(txn.metadata_ or {})
-            meta["pending_reason"] = reason
+            if reason:
+                meta["pending_reason"] = reason
+            if pp_order_id and not meta.get("paypal_order_id") and not meta.get("order_id"):
+                meta["paypal_order_id"] = pp_order_id
             txn.metadata_ = meta
 
         desc = (

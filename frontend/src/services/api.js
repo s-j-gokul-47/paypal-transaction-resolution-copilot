@@ -19,8 +19,21 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    const rawDetail = error.response?.data?.detail
+    let formattedDetail = null
+    if (Array.isArray(rawDetail)) {
+      formattedDetail = rawDetail
+        .map((item) => (typeof item === 'string' ? item : item?.msg || JSON.stringify(item)))
+        .filter(Boolean)
+        .join('; ')
+    } else if (typeof rawDetail === 'string') {
+      formattedDetail = rawDetail
+    } else if (rawDetail && typeof rawDetail === 'object') {
+      formattedDetail = rawDetail.message || JSON.stringify(rawDetail)
+    }
+
     const message =
-      error.response?.data?.detail ||
+      formattedDetail ||
       error.response?.data?.message ||
       error.message ||
       'An unexpected error occurred'
@@ -45,6 +58,10 @@ export const transactionService = {
   getResolution: (id) => api.get(`/api/transactions/${id}/resolution`),
   getTimeline: (id) => api.get(`/api/transactions/${id}/timeline`),
   getDuplicates: (id) => api.get(`/api/transactions/${id}/duplicates`),
+  getDuplicateInvestigation: (id, otherId) =>
+    api.get(`/api/transactions/${encodeURIComponent(id)}/duplicates/${encodeURIComponent(otherId)}/investigation`),
+  submitDuplicateReview: (id, otherId, data) =>
+    api.post(`/api/transactions/${encodeURIComponent(id)}/duplicates/${encodeURIComponent(otherId)}/review`, data),
   explain: (id) => api.post(`/api/transactions/${id}/explain`),
   generateSupportSummary: (id, data) => api.post(`/api/transactions/${id}/support-summary`, data),
   refund: (id, data = {}) => api.post(`/api/transactions/${id}/refund`, data),

@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 from models import AIRecommendationResponse
-from status_engine import StatusEngine, get_refund_summary
+from status_engine import StatusEngine, extract_order_id, get_refund_summary
 
 ai_logger = logging.getLogger("paypal_copilot.ai")
 
@@ -288,7 +288,7 @@ def _build_heuristic_support_summary(
     metadata = transaction_data.get("metadata") or transaction_data.get("metadata_") or {}
     if not isinstance(metadata, dict):
         metadata = {}
-    order_id = metadata.get("order_id") or metadata.get("paypal_order_id")
+    order_id = extract_order_id(transaction_data)
     error_code = metadata.get("error_code")
     pending_reason = metadata.get("pending_reason")
 

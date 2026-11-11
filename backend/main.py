@@ -23,16 +23,19 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Query, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 load_dotenv()
 
 from database import get_db, init_db, SessionLocal
 from models import (
-    Transaction, TransactionEvent, Dispute, ResolutionCase, WebhookEvent,
+    Transaction, TransactionEvent, Dispute, ResolutionCase, WebhookEvent, DuplicateReview,
     TransactionCreate, TransactionResponse, PaginatedTransactionsResponse,
     TransactionEventResponse, TransactionStateExplanation,
-    DuplicateAnalysisResponse, SupportSummaryRequest, SupportSummaryResponse,
+    DuplicateAnalysisResponse, DuplicateReviewRequest, DuplicateReviewResponse,
+    DuplicateSideBySideTransaction, DuplicateInvestigationResponse,
+    SupportSummaryRequest, SupportSummaryResponse,
     RefundRequest,
     DisputeCreate, DisputeResponse, PaginatedDisputesResponse,
     ResolutionCaseCreate, ResolutionCaseUpdate, ResolutionCaseResponse, PaginatedCasesResponse,
@@ -40,7 +43,7 @@ from models import (
 )
 from paypal_service import PayPalService, PayPalAPIError
 from ai_service import AIService
-from status_engine import StatusEngine, get_refund_summary, record_refund_state
+from status_engine import StatusEngine, extract_order_id, get_refund_summary, record_refund_state
 from webhook_service import WebhookService, MalformedWebhookError, WebhookProcessingError
 
 webhook_logger = logging.getLogger("paypal_copilot.webhooks")
@@ -115,9 +118,94 @@ def _dispute_to_dict(d: Dispute) -> dict:
     }
 
 
-def _serialize_transaction(txn: Transaction, all_txns: List[Transaction]) -> TransactionResponse:
-    dups = status_engine.detect_duplicate_transactions(txn, all_txns)
-    active_dups = [d for d in dups if d["classification"] == "POSSIBLE_DUPLICATE"]
+def _canonicalize_pair(
+    txn_a: Transaction,
+    txn_b: Transaction,
+) -> tuple[Transaction, Transaction, str, str]:
+    """
+    Assign deterministic chronological roles (`original`, `extra`) using `created_at`
+    with transaction `id` as tie-breaker, plus sorted `(pair_low_id, pair_high_id)`.
+    """
+    key_a = (txn_a.created_at or datetime.min, txn_a.id)
+    key_b = (txn_b.created_at or datetime.min, txn_b.id)
+    if key_a <= key_b:
+        original_txn, extra_txn = txn_a, txn_b
+    else:
+        original_txn, extra_txn = txn_b, txn_a
+    pair_low_id, pair_high_id = sorted([txn_a.id, txn_b.id])
+    return original_txn, extra_txn, pair_low_id, pair_high_id
+
+
+def _load_review_map(db: Session) -> dict[tuple[str, str], DuplicateReview]:
+    return {
+        (r.pair_low_id, r.pair_high_id): r
+        for r in db.query(DuplicateReview).all()
+    }
+
+
+def _is_active_duplicate_candidate(cand: dict, review: Optional[DuplicateReview]) -> bool:
+    """
+    Determine whether a duplicate candidate should trigger active duplicate alerts.
+    Persisted `SEPARATE_ORDERS` decisions always suppress alert counts while keeping
+    candidates available in investigation responses.
+    """
+    if review and review.decision == "SEPARATE_ORDERS":
+        return False
+    if (
+        review
+        and review.decision == "CONFIRMED_DUPLICATE"
+        and cand.get("classification") not in {"RETRY_AFTER_FAILURE", "ALREADY_REFUNDED"}
+    ):
+        return True
+    return cand.get("classification") == "POSSIBLE_DUPLICATE"
+
+
+def _analyze_duplicates_for_txn(
+    txn: Transaction,
+    all_txns: List[Transaction],
+    review_map: Optional[dict[tuple[str, str], DuplicateReview]] = None,
+) -> tuple[list[dict], bool]:
+    """
+    Run duplicate detection for `txn` and enrich each candidate with chronological
+    role (`ORIGINAL` or `EXTRA_CANDIDATE`) and persisted review state.
+    """
+    txn_by_id = {t.id: t for t in all_txns}
+    reviews = review_map or {}
+    candidates = status_engine.detect_duplicate_transactions(txn, all_txns)
+    has_possible = False
+
+    for cand in candidates:
+        other = txn_by_id.get(cand["transaction_id"])
+        review = None
+        if other:
+            _, extra_txn, pair_low, pair_high = _canonicalize_pair(txn, other)
+            review = reviews.get((pair_low, pair_high))
+            cand["role"] = "EXTRA_CANDIDATE" if extra_txn.id == other.id else "ORIGINAL"
+        cand["review_decision"] = review.decision if review else "PENDING_REVIEW"
+        cand["reviewer_verified"] = bool(review.reviewer_verified) if review else False
+        if _is_active_duplicate_candidate(cand, review):
+            has_possible = True
+
+    return candidates, has_possible
+
+
+def _serialize_transaction(
+    txn: Transaction,
+    all_txns: List[Transaction],
+    review_map: Optional[dict[tuple[str, str], DuplicateReview]] = None,
+) -> TransactionResponse:
+    candidates, _ = _analyze_duplicates_for_txn(txn, all_txns, review_map)
+    reviews = review_map or {}
+    txn_by_id = {t.id: t for t in all_txns}
+    active_count = 0
+    for c in candidates:
+        other = txn_by_id.get(c["transaction_id"])
+        review = None
+        if other:
+            _, _, low_id, high_id = _canonicalize_pair(txn, other)
+            review = reviews.get((low_id, high_id))
+        if _is_active_duplicate_candidate(c, review):
+            active_count += 1
     return TransactionResponse(
         id=txn.id,
         paypal_transaction_id=txn.paypal_transaction_id,
@@ -131,7 +219,7 @@ def _serialize_transaction(txn: Transaction, all_txns: List[Transaction]) -> Tra
         metadata=txn.metadata_ or {},
         created_at=txn.created_at,
         updated_at=txn.updated_at,
-        possible_duplicate_count=len(active_dups),
+        possible_duplicate_count=active_count,
         dispute_count=len(txn.disputes or []),
     )
 
@@ -572,27 +660,36 @@ def get_analytics_summary(db: Session = Depends(get_db)):
     for d in all_disputes:
         dispute_status_counts[d.status] = dispute_status_counts.get(d.status, 0) + 1
 
-    # Count unique duplicate pairs
+    # Count unique active duplicate pairs ordered chronologically (ORIGINAL -> EXTRA)
+    review_map = _load_review_map(db)
+    txn_by_id = {t.id: t for t in all_txns}
     seen_pairs: set[tuple[str, str]] = set()
     duplicate_alerts: list[dict] = []
     for t in all_txns:
-        dups = status_engine.detect_duplicate_transactions(t, all_txns)
+        dups, _ = _analyze_duplicates_for_txn(t, all_txns, review_map)
         for dup in dups:
-            if dup["classification"] == "POSSIBLE_DUPLICATE":
-                pair = tuple(sorted([t.id, dup["transaction_id"]]))
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    duplicate_alerts.append({
-                        "primary_id": t.id,
-                        "primary_paypal_id": t.paypal_transaction_id,
-                        "duplicate_id": dup["transaction_id"],
-                        "duplicate_paypal_id": dup["paypal_transaction_id"],
-                        "amount": t.amount,
-                        "currency": t.currency,
-                        "buyer_email": t.buyer_email,
-                        "confidence": dup["confidence"],
-                        "time_diff_seconds": dup["time_diff_seconds"],
-                    })
+            other_txn = txn_by_id.get(dup["transaction_id"])
+            if not other_txn:
+                continue
+            orig_txn, extra_txn, low_id, high_id = _canonicalize_pair(t, other_txn)
+            review = review_map.get((low_id, high_id))
+            if not _is_active_duplicate_candidate(dup, review):
+                continue
+            pair = (low_id, high_id)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                duplicate_alerts.append({
+                    "primary_id": orig_txn.id,
+                    "primary_paypal_id": orig_txn.paypal_transaction_id,
+                    "duplicate_id": extra_txn.id,
+                    "duplicate_paypal_id": extra_txn.paypal_transaction_id,
+                    "amount": extra_txn.amount,
+                    "currency": extra_txn.currency,
+                    "buyer_email": extra_txn.buyer_email,
+                    "confidence": dup["confidence"],
+                    "time_diff_seconds": dup["time_diff_seconds"],
+                    "review_decision": review.decision if review else "PENDING_REVIEW",
+                })
 
     sla_breached = sum(1 for c in all_cases if status_engine.check_sla_breach(c)[0])
     attention_needed = sum(
@@ -669,9 +766,10 @@ def list_transactions(
 
     total = q.count()
     items = q.order_by(Transaction.created_at.desc()).offset(skip).limit(limit).all()
+    review_map = _load_review_map(db)
 
     return PaginatedTransactionsResponse(
-        items=[_serialize_transaction(t, all_txns) for t in items],
+        items=[_serialize_transaction(t, all_txns, review_map) for t in items],
         total=total,
         skip=skip,
         limit=limit,
@@ -684,7 +782,8 @@ def get_transaction(transaction_id: str, db: Session = Depends(get_db)):
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
     all_txns = db.query(Transaction).all()
-    return _serialize_transaction(txn, all_txns)
+    review_map = _load_review_map(db)
+    return _serialize_transaction(txn, all_txns, review_map)
 
 
 @app.post("/api/transactions", response_model=TransactionResponse, status_code=201, tags=["Transactions"])
@@ -727,7 +826,8 @@ def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)
     db.commit()
     db.refresh(txn)
     all_txns = db.query(Transaction).all()
-    return _serialize_transaction(txn, all_txns)
+    review_map = _load_review_map(db)
+    return _serialize_transaction(txn, all_txns, review_map)
 
 
 @app.get("/api/transactions/{transaction_id}/timeline", response_model=List[TransactionEventResponse], tags=["Transactions"])
@@ -744,13 +844,449 @@ def get_transaction_duplicates(transaction_id: str, db: Session = Depends(get_db
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
     all_txns = db.query(Transaction).all()
-    candidates = status_engine.detect_duplicate_transactions(txn, all_txns)
-    has_possible = any(c["classification"] == "POSSIBLE_DUPLICATE" for c in candidates)
+    review_map = _load_review_map(db)
+    candidates, has_possible = _analyze_duplicates_for_txn(txn, all_txns, review_map)
     return DuplicateAnalysisResponse(
         transaction_id=txn.id,
         has_possible_duplicates=has_possible,
         candidates=candidates,
     )
+
+
+def _to_side_by_side_summary(txn: Transaction, role: str) -> DuplicateSideBySideTransaction:
+    total_refunded, remaining, _ = get_refund_summary(txn.amount, txn.status, txn.metadata_)
+    return DuplicateSideBySideTransaction(
+        id=txn.id,
+        paypal_transaction_id=txn.paypal_transaction_id,
+        status=txn.status,
+        amount=txn.amount,
+        currency=txn.currency,
+        order_id=extract_order_id(txn),
+        description=txn.description,
+        buyer_email=txn.buyer_email,
+        merchant_id=txn.merchant_id,
+        created_at=txn.created_at,
+        total_refunded=total_refunded,
+        remaining_refundable=remaining,
+        role=role,
+        refund_eligible=(txn.status == "COMPLETED" and remaining > 0.005),
+    )
+
+
+def _build_review_response(
+    review: Optional[DuplicateReview],
+    pair_low_id: str,
+    pair_high_id: str,
+    original_txn: Transaction,
+    extra_txn: Transaction,
+) -> DuplicateReviewResponse:
+    if review is None:
+        return DuplicateReviewResponse(
+            id=None,
+            pair_low_id=pair_low_id,
+            pair_high_id=pair_high_id,
+            original_transaction_id=original_txn.id,
+            extra_transaction_id=extra_txn.id,
+            decision="PENDING_REVIEW",
+            reviewer=None,
+            reviewer_verified=False,
+            notes=None,
+            decision_history=[],
+            created_at=None,
+            updated_at=None,
+        )
+    return DuplicateReviewResponse(
+        id=review.id,
+        pair_low_id=review.pair_low_id,
+        pair_high_id=review.pair_high_id,
+        original_transaction_id=review.original_transaction_id,
+        extra_transaction_id=review.extra_transaction_id,
+        decision=review.decision,
+        reviewer=review.reviewer,
+        reviewer_verified=bool(review.reviewer_verified),
+        notes=review.notes,
+        decision_history=list(review.decision_history or []),
+        created_at=review.created_at,
+        updated_at=review.updated_at,
+    )
+
+
+def _build_side_by_side_comparison(
+    orig_txn: Transaction,
+    extra_txn: Transaction,
+) -> dict:
+    # Run detector on just this pair with a wide window so direct investigation always works
+    pair_matches = status_engine.detect_duplicate_transactions(
+        orig_txn,
+        [orig_txn, extra_txn],
+        window_hours=24 * 3650,
+    )
+    cand = pair_matches[0] if pair_matches else None
+
+    orig_order = extract_order_id(orig_txn)
+    extra_order = extract_order_id(extra_txn)
+    diff_seconds = (
+        int(abs((extra_txn.created_at - orig_txn.created_at).total_seconds()))
+        if (orig_txn.created_at and extra_txn.created_at)
+        else 0
+    )
+
+    def _row_status(val_a, val_b, case_insensitive: bool = False) -> str:
+        if not val_a or not val_b:
+            return "UNAVAILABLE"
+        a = str(val_a).strip()
+        b = str(val_b).strip()
+        if case_insensitive:
+            a, b = a.lower(), b.lower()
+        return "MATCH" if a == b else "DIFFERENT"
+
+    order_status = "UNAVAILABLE"
+    if orig_order and extra_order:
+        if cand and cand.get("order_relationship") == "EXACT_MATCH":
+            order_status = "MATCH"
+        elif cand and cand.get("order_relationship") == "POSSIBLE_RETRY_VARIANT":
+            order_status = "VARIANT"
+        elif orig_order.strip().upper() == extra_order.strip().upper():
+            order_status = "MATCH"
+        else:
+            order_status = "DIFFERENT"
+
+    field_matrix = [
+        {
+            "field": "PayPal Transaction ID",
+            "original_value": orig_txn.paypal_transaction_id,
+            "extra_value": extra_txn.paypal_transaction_id,
+            "match_status": "DIFFERENT",
+        },
+        {
+            "field": "Order ID",
+            "original_value": orig_order,
+            "extra_value": extra_order,
+            "match_status": order_status,
+        },
+        {
+            "field": "Amount",
+            "original_value": f"{orig_txn.amount:.2f} {orig_txn.currency}",
+            "extra_value": f"{extra_txn.amount:.2f} {extra_txn.currency}",
+            "match_status": (
+                "MATCH"
+                if abs(orig_txn.amount - extra_txn.amount) <= 0.01
+                and (orig_txn.currency or "").upper() == (extra_txn.currency or "").upper()
+                else "DIFFERENT"
+            ),
+        },
+        {
+            "field": "Status",
+            "original_value": orig_txn.status,
+            "extra_value": extra_txn.status,
+            "match_status": "MATCH" if orig_txn.status == extra_txn.status else "DIFFERENT",
+        },
+        {
+            "field": "Buyer Email",
+            "original_value": orig_txn.buyer_email,
+            "extra_value": extra_txn.buyer_email,
+            "match_status": _row_status(orig_txn.buyer_email, extra_txn.buyer_email, case_insensitive=True),
+        },
+        {
+            "field": "Merchant ID",
+            "original_value": orig_txn.merchant_id,
+            "extra_value": extra_txn.merchant_id,
+            "match_status": _row_status(orig_txn.merchant_id, extra_txn.merchant_id, case_insensitive=True),
+        },
+        {
+            "field": "Description",
+            "original_value": orig_txn.description,
+            "extra_value": extra_txn.description,
+            "match_status": _row_status(orig_txn.description, extra_txn.description, case_insensitive=True),
+        },
+        {
+            "field": "Timestamp (UTC)",
+            "original_value": orig_txn.created_at.isoformat() + "Z" if orig_txn.created_at else None,
+            "extra_value": extra_txn.created_at.isoformat() + "Z" if extra_txn.created_at else None,
+            "match_status": "MATCH" if diff_seconds == 0 else "DIFFERENT",
+        },
+    ]
+
+    differences = [
+        f"{row['field']}: {row['original_value'] or 'Unavailable'} vs {row['extra_value'] or 'Unavailable'}"
+        for row in field_matrix
+        if row["match_status"] in {"DIFFERENT", "VARIANT"}
+    ]
+    matching_fields = (
+        list(cand["matching_fields"])
+        if cand
+        else [
+            row["field"].lower().replace(" ", "_")
+            for row in field_matrix
+            if row["match_status"] == "MATCH"
+        ]
+    )
+
+    return {
+        "time_diff_seconds": diff_seconds,
+        "classification": cand["classification"] if cand else "UNMATCHED_CRITERIA",
+        "confidence": cand["confidence"] if cand else "LOW",
+        "order_relationship": cand.get("order_relationship") if cand else order_status,
+        "matching_fields": matching_fields,
+        "differences": differences,
+        "field_matrix": field_matrix,
+        "explanation": (
+            cand["explanation"]
+            if cand
+            else "Transactions differ on core matching attributes (buyer, merchant, amount, currency, or time window)."
+        ),
+        "recommended_action": (
+            cand["recommended_action"]
+            if cand
+            else "Verify both transactions independently before taking action."
+        ),
+    }
+
+
+def _resolve_pair_or_400(
+    db: Session,
+    transaction_id: str,
+    other_transaction_id: str,
+) -> tuple[Transaction, Transaction, str, str]:
+    txn_a = _find_transaction(db, transaction_id)
+    if not txn_a:
+        raise HTTPException(status_code=404, detail=f"Transaction '{transaction_id}' not found")
+    txn_b = _find_transaction(db, other_transaction_id)
+    if not txn_b:
+        raise HTTPException(status_code=404, detail=f"Transaction '{other_transaction_id}' not found")
+    if txn_a.id == txn_b.id:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot investigate or review a transaction against itself",
+        )
+    return _canonicalize_pair(txn_a, txn_b)
+
+
+def _add_review_audit_events(
+    db: Session,
+    original_txn: Transaction,
+    extra_txn: Transaction,
+    decision: str,
+    previous_decision: Optional[str],
+    reviewer: str,
+    override_reason: Optional[str],
+    notes: Optional[str],
+    now: datetime,
+) -> None:
+    is_override = previous_decision is not None and previous_decision != "PENDING_REVIEW"
+    title = (
+        f"Duplicate review overridden: {decision}"
+        if is_override
+        else f"Duplicate review: {decision}"
+    )
+    reason_part = f" Override reason: {override_reason}." if override_reason else ""
+    notes_part = f" Notes: {notes}." if notes else ""
+    description = (
+        f"Pair ({original_txn.paypal_transaction_id} [ORIGINAL] / "
+        f"{extra_txn.paypal_transaction_id} [EXTRA_CANDIDATE]) marked {decision} "
+        f"by {reviewer} (verified=false).{reason_part}{notes_part}"
+    )
+    details = {
+        "original_transaction_id": original_txn.id,
+        "extra_transaction_id": extra_txn.id,
+        "decision": decision,
+        "previous_decision": previous_decision,
+        "override_reason": override_reason,
+        "reviewer": reviewer,
+        "reviewer_verified": False,
+        "notes": notes,
+    }
+    for txn_id in (original_txn.id, extra_txn.id):
+        db.add(
+            TransactionEvent(
+                id=str(uuid.uuid4()),
+                transaction_id=txn_id,
+                event_type="DUPLICATE_REVIEWED",
+                title=title,
+                description=description,
+                source="review",
+                details=details,
+                occurred_at=now,
+            )
+        )
+
+
+@app.get(
+    "/api/transactions/{transaction_id}/duplicates/{other_transaction_id}/investigation",
+    response_model=DuplicateInvestigationResponse,
+    tags=["Transactions"],
+)
+def get_duplicate_investigation(
+    transaction_id: str,
+    other_transaction_id: str,
+    db: Session = Depends(get_db),
+):
+    orig_txn, extra_txn, low_id, high_id = _resolve_pair_or_400(
+        db, transaction_id, other_transaction_id
+    )
+    review = (
+        db.query(DuplicateReview)
+        .filter(
+            DuplicateReview.pair_low_id == low_id,
+            DuplicateReview.pair_high_id == high_id,
+        )
+        .first()
+    )
+    return DuplicateInvestigationResponse(
+        pair_low_id=low_id,
+        pair_high_id=high_id,
+        original_transaction=_to_side_by_side_summary(orig_txn, "ORIGINAL"),
+        extra_candidate=_to_side_by_side_summary(extra_txn, "EXTRA_CANDIDATE"),
+        comparison=_build_side_by_side_comparison(orig_txn, extra_txn),
+        review=_build_review_response(review, low_id, high_id, orig_txn, extra_txn),
+    )
+
+
+@app.post(
+    "/api/transactions/{transaction_id}/duplicates/{other_transaction_id}/review",
+    response_model=DuplicateReviewResponse,
+    tags=["Transactions"],
+)
+def submit_duplicate_review(
+    transaction_id: str,
+    other_transaction_id: str,
+    payload: DuplicateReviewRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Persist a human duplicate investigation decision (`CONFIRMED_DUPLICATE` or
+    `SEPARATE_ORDERS`) and append an audit entry to both transactions.
+    Never triggers refunds. `reviewer_verified` is always False without auth.
+    """
+    orig_txn, extra_txn, low_id, high_id = _resolve_pair_or_400(
+        db, transaction_id, other_transaction_id
+    )
+    decision = payload.decision
+    reviewer = (payload.reviewer or "").strip() or "unauthenticated-agent"
+    notes = (payload.notes or "").strip() or None
+    override_reason = (payload.override_reason or "").strip() or None
+    now = datetime.utcnow()
+
+    existing = (
+        db.query(DuplicateReview)
+        .filter(
+            DuplicateReview.pair_low_id == low_id,
+            DuplicateReview.pair_high_id == high_id,
+        )
+        .first()
+    )
+
+    if existing is None:
+        entry = {
+            "decision": decision,
+            "previous_decision": "PENDING_REVIEW",
+            "override_reason": override_reason,
+            "notes": notes,
+            "reviewer": reviewer,
+            "reviewer_verified": False,
+            "recorded_at": now.isoformat() + "Z",
+        }
+        review = DuplicateReview(
+            id=str(uuid.uuid4()),
+            pair_low_id=low_id,
+            pair_high_id=high_id,
+            original_transaction_id=orig_txn.id,
+            extra_transaction_id=extra_txn.id,
+            decision=decision,
+            reviewer=reviewer,
+            reviewer_verified=False,
+            notes=notes,
+            decision_history=[entry],
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(review)
+        _add_review_audit_events(
+            db, orig_txn, extra_txn, decision, "PENDING_REVIEW", reviewer, override_reason, notes, now
+        )
+        try:
+            db.commit()
+            db.refresh(review)
+            return _build_review_response(review, low_id, high_id, orig_txn, extra_txn)
+        except IntegrityError:
+            db.rollback()
+            existing = (
+                db.query(DuplicateReview)
+                .filter(
+                    DuplicateReview.pair_low_id == low_id,
+                    DuplicateReview.pair_high_id == high_id,
+                )
+                .first()
+            )
+            if existing is None:
+                raise HTTPException(status_code=409, detail="Concurrent review conflict; please retry")
+            if existing.decision == decision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Duplicate review decision '{decision}' was already recorded for this pair",
+                )
+            if not override_reason:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Pair was concurrently reviewed as '{existing.decision}'; "
+                        "provide override_reason to reverse it"
+                    ),
+                )
+
+    # Updating / overriding an existing review record
+    prev_decision = existing.decision
+    if prev_decision == decision:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Duplicate review decision '{decision}' has already been recorded for this pair",
+        )
+    if prev_decision != "PENDING_REVIEW" and not override_reason:
+        raise HTTPException(
+            status_code=422,
+            detail="override_reason is required when reversing an existing review decision",
+        )
+
+    entry = {
+        "decision": decision,
+        "previous_decision": prev_decision,
+        "override_reason": override_reason,
+        "notes": notes,
+        "reviewer": reviewer,
+        "reviewer_verified": False,
+        "recorded_at": now.isoformat() + "Z",
+    }
+    new_history = [*list(existing.decision_history or []), entry]
+    updated_rows = (
+        db.query(DuplicateReview)
+        .filter(
+            DuplicateReview.id == existing.id,
+            DuplicateReview.decision == prev_decision,
+        )
+        .update(
+            {
+                "original_transaction_id": orig_txn.id,
+                "extra_transaction_id": extra_txn.id,
+                "decision": decision,
+                "reviewer": reviewer,
+                "reviewer_verified": False,
+                "notes": notes,
+                "decision_history": new_history,
+                "updated_at": now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if updated_rows == 0:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Concurrent review state changed; please reload and retry")
+
+    _add_review_audit_events(
+        db, orig_txn, extra_txn, decision, prev_decision, reviewer, override_reason, notes, now
+    )
+    db.commit()
+    refreshed = db.query(DuplicateReview).filter(DuplicateReview.id == existing.id).first()
+    return _build_review_response(refreshed, low_id, high_id, orig_txn, extra_txn)
 
 
 @app.get("/api/transactions/{transaction_id}/resolution", tags=["Transactions"])
@@ -764,9 +1300,10 @@ async def get_transaction_resolution(transaction_id: str, db: Session = Depends(
         raise HTTPException(status_code=404, detail="Transaction not found")
 
     all_txns = db.query(Transaction).all()
-    txn_serialized = _serialize_transaction(txn, all_txns)
+    review_map = _load_review_map(db)
+    txn_serialized = _serialize_transaction(txn, all_txns, review_map)
     timeline = [_event_to_dict(ev) for ev in txn.events]
-    duplicates = status_engine.detect_duplicate_transactions(txn, all_txns)
+    duplicates, has_possible = _analyze_duplicates_for_txn(txn, all_txns, review_map)
     disputes = [_dispute_to_dict(d) for d in txn.disputes]
     explanation = await ai_service.explain_transaction(
         _txn_to_dict(txn), timeline, duplicates, disputes
@@ -777,9 +1314,7 @@ async def get_transaction_resolution(transaction_id: str, db: Session = Depends(
         "timeline": timeline,
         "duplicates": {
             "transaction_id": txn.id,
-            "has_possible_duplicates": any(
-                c["classification"] == "POSSIBLE_DUPLICATE" for c in duplicates
-            ),
+            "has_possible_duplicates": has_possible,
             "candidates": duplicates,
         },
         "explanation": explanation,
@@ -922,9 +1457,10 @@ async def refund_transaction(
     db.commit()
     db.refresh(txn)
     all_txns = db.query(Transaction).all()
+    review_map = _load_review_map(db)
 
     return {
-        "transaction": _serialize_transaction(txn, all_txns),
+        "transaction": _serialize_transaction(txn, all_txns, review_map),
         "paypal_response": paypal_res,
     }
 
@@ -1412,14 +1948,25 @@ def _upsert_paypal_capture_in_db(
     txn = db.query(Transaction).filter(Transaction.paypal_transaction_id == capture_id).first()
     is_new = txn is None
 
+    resolved_order_id = (
+        (order_payload or {}).get("id")
+        or ((capture.get("supplementary_data") or {}).get("related_ids") or {}).get("order_id")
+        or ((txn.metadata_ or {}).get("paypal_order_id") if txn else None)
+        or ((txn.metadata_ or {}).get("order_id") if txn else None)
+    )
+
     metadata_payload = {
         "paypal_raw_status": raw_status,
-        "paypal_order_id": (order_payload or {}).get("id"),
         "paypal_capture": capture,
         "is_simulated": bool((order_payload or capture).get("is_simulated")),
     }
-    if (raw_status or "").upper() == "PARTIALLY_REFUNDED":
+    if resolved_order_id:
+        metadata_payload["paypal_order_id"] = resolved_order_id
+    raw_upper = (raw_status or "").upper()
+    if raw_upper == "PARTIALLY_REFUNDED":
         metadata_payload["partial_refund"] = True
+    elif raw_upper == "REFUNDED":
+        metadata_payload["partial_refund"] = False
 
     if is_new:
         txn = Transaction(
@@ -1445,7 +1992,7 @@ def _upsert_paypal_capture_in_db(
                 title=f"PayPal capture stored ({raw_status})",
                 description=f"Captured {amount:.2f} {currency} via PayPal ({capture.get('mode', paypal_service.environment_label)}).",
                 source=source,
-                details={"capture_id": capture_id, "order_id": (order_payload or {}).get("id")},
+                details={"capture_id": capture_id, "order_id": resolved_order_id},
                 occurred_at=now,
             )
         )
@@ -1528,8 +2075,9 @@ async def capture_paypal_order(order_id: str, db: Session = Depends(get_db)):
 
     txn = _upsert_paypal_capture_in_db(db, capture=capture, order_payload=res, description=desc, source=source)
     all_txns = db.query(Transaction).all()
+    review_map = _load_review_map(db)
     return {
-        "transaction": _serialize_transaction(txn, all_txns),
+        "transaction": _serialize_transaction(txn, all_txns, review_map),
         "paypal_response": res,
     }
 
@@ -1544,8 +2092,9 @@ async def sync_paypal_capture(capture_id: str, db: Session = Depends(get_db)):
     source = "mock" if capture.get("is_simulated") else "paypal_api"
     txn = _upsert_paypal_capture_in_db(db, capture=capture, source=source)
     all_txns = db.query(Transaction).all()
+    review_map = _load_review_map(db)
     return {
-        "transaction": _serialize_transaction(txn, all_txns),
+        "transaction": _serialize_transaction(txn, all_txns, review_map),
         "paypal_response": capture,
     }
 

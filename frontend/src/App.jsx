@@ -4,6 +4,7 @@ import Sidebar from './components/Sidebar'
 import Dashboard from './pages/Dashboard'
 import TransactionList from './pages/TransactionList'
 import TransactionDetail from './pages/TransactionDetail'
+import DuplicateInvestigation from './pages/DuplicateInvestigation'
 import DisputeList from './pages/DisputeList'
 import DisputeDetail from './pages/DisputeDetail'
 import CaseList from './pages/CaseList'
@@ -22,6 +23,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/transactions" element={<TransactionList />} />
             <Route path="/transactions/:id" element={<TransactionDetail />} />
+            <Route path="/transactions/:id/duplicates/:otherId" element={<DuplicateInvestigation />} />
             <Route path="/disputes" element={<DisputeList />} />
             <Route path="/disputes/:id" element={<DisputeDetail />} />
             <Route path="/cases" element={<CaseList />} />

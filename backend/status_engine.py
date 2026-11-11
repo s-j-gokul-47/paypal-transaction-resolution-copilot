@@ -6,6 +6,7 @@ Provides:
   - Deterministic, record-grounded transaction state explanations
   - Dispute priority, next actions, and SLA tracking (secondary workflow)
 """
+import re
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Iterable
@@ -80,6 +81,62 @@ def _parse_dt(value) -> Optional[datetime]:
         except ValueError:
             return None
     return None
+
+
+def extract_order_id(obj) -> Optional[str]:
+    """
+    Resolve an order reference consistently across seed records (`order_id`),
+    PayPal Orders v2 captures (`paypal_order_id`), and capture payloads
+    (`paypal_capture.supplementary_data.related_ids.order_id`).
+    """
+    meta = _get_attr(obj, "metadata_") or _get_attr(obj, "metadata") or {}
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("order_id") or meta.get("paypal_order_id")
+    if not raw and isinstance(meta.get("paypal_capture"), dict):
+        raw = ((meta["paypal_capture"].get("supplementary_data") or {}).get("related_ids") or {}).get("order_id")
+    if raw is None or raw == "":
+        return None
+    cleaned = str(raw).strip()
+    return cleaned or None
+
+
+def _compare_order_ids(order_a: Optional[str], order_b: Optional[str]) -> str:
+    """
+    Compare two order IDs conservatively:
+      - `EXACT_MATCH`: identical normalized order IDs
+      - `POSSIBLE_RETRY_VARIANT`: one ID is strictly `<other>-(B..Z|RETRY)` (base len >= 4)
+      - `DIFFERENT`: both known and unrelated
+      - `UNKNOWN`: one or both missing
+    """
+    if not order_a or not order_b:
+        return "UNKNOWN"
+    norm_a = order_a.strip().upper()
+    norm_b = order_b.strip().upper()
+    if norm_a == norm_b:
+        return "EXACT_MATCH"
+    shorter, longer = sorted((norm_a, norm_b), key=len)
+    if len(shorter) >= 4 and longer.startswith(shorter + "-"):
+        suffix = longer[len(shorter) + 1 :]
+        if re.fullmatch(r"(?:[B-Z]|RETRY)", suffix):
+            return "POSSIBLE_RETRY_VARIANT"
+    return "DIFFERENT"
+
+
+def _compare_descriptions(desc_a: Optional[str], desc_b: Optional[str]) -> str:
+    """Compare payment descriptions strictly as supporting evidence."""
+    a = " ".join(re.findall(r"[a-z0-9]+", (desc_a or "").lower()))
+    b = " ".join(re.findall(r"[a-z0-9]+", (desc_b or "").lower()))
+    if not a or not b:
+        return "UNKNOWN"
+    if a == b:
+        return "EXACT_MATCH"
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    smaller, larger = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    if smaller and len(smaller & larger) / len(smaller) >= 0.75:
+        return "SIMILAR"
+    return "DIFFERENT"
 
 
 def _get_attr(obj, key: str, default=None):
@@ -265,9 +322,16 @@ class StatusEngine:
         window_hours: int = 24,
     ) -> list[dict]:
         """
-        Identify potential duplicate charges or retry patterns for `target_txn`
-        by comparing verified fields (`buyer_email`, `merchant_id`, `amount`,
-        `currency`, `created_at`, `status`).
+        Identify potential duplicate charges, retry patterns, or separate same-amount
+        orders for `target_txn`. Flags candidates only — never triggers refunds.
+
+        Order IDs drive primary differentiation:
+          - Matching order IDs strengthen duplicate evidence (`HIGH` confidence)
+          - Conservative retry suffixes (e.g., `ORD-10001` vs `ORD-10001-B`) signal a
+            possible retry relationship (`MEDIUM` max, requiring verification)
+          - Different unrelated order IDs suppress duplicate alerts (`SEPARATE_ORDERS`,
+            `LOW` confidence) while retaining the record for agent review
+          - Missing order IDs never reach `HIGH` confidence from time proximity alone
         """
         target_id = _get_attr(target_txn, "id")
         target_buyer = (_get_attr(target_txn, "buyer_email") or "").strip().lower()
@@ -276,6 +340,8 @@ class StatusEngine:
         target_amount = float(_get_attr(target_txn, "amount") or 0)
         target_status = (_get_attr(target_txn, "status") or "PENDING").upper()
         target_created = _parse_dt(_get_attr(target_txn, "created_at"))
+        target_order_id = extract_order_id(target_txn)
+        target_desc = _get_attr(target_txn, "description")
 
         if not target_buyer or not target_created:
             return []
@@ -295,10 +361,11 @@ class StatusEngine:
             other_status = (_get_attr(other, "status") or "PENDING").upper()
             other_created = _parse_dt(_get_attr(other, "created_at"))
             other_pp_id = _get_attr(other, "paypal_transaction_id") or other_id
+            other_order_id = extract_order_id(other)
+            other_desc = _get_attr(other, "description")
 
             if not other_created:
                 continue
-
             if other_buyer != target_buyer or other_currency != target_currency:
                 continue
             if abs(other_amount - target_amount) > 0.01:
@@ -310,16 +377,16 @@ class StatusEngine:
             if diff_seconds > max_seconds:
                 continue
 
+            order_rel = _compare_order_ids(target_order_id, other_order_id)
+            desc_rel = _compare_descriptions(target_desc, other_desc)
+
             matching_fields = ["buyer_email", "amount", "currency"]
             if target_merchant == other_merchant and target_merchant:
                 matching_fields.append("merchant_id")
-
-            if diff_seconds <= 900:
-                confidence = "HIGH"
-            elif diff_seconds <= 4 * 3600:
-                confidence = "MEDIUM"
-            else:
-                confidence = "LOW"
+            if order_rel == "EXACT_MATCH":
+                matching_fields.append("order_id")
+            if desc_rel in {"EXACT_MATCH", "SIMILAR"}:
+                matching_fields.append("description")
 
             minutes = max(1, diff_seconds // 60)
             if diff_seconds < 60:
@@ -330,28 +397,103 @@ class StatusEngine:
                 time_phrase = f"{round(diff_seconds / 3600, 1)} hour(s) apart"
 
             pair_statuses = {target_status, other_status}
-            if "FAILED" in pair_statuses and pair_statuses != {"FAILED"}:
+
+            if "FAILED" in pair_statuses:
                 classification = "RETRY_AFTER_FAILURE"
-                explanation = (
-                    f"Matched {other_pp_id} ({other_status}) for {other_amount:.2f} {other_currency} "
-                    f"({time_phrase}). One payment failed, indicating a customer retry rather than a double capture."
-                )
-                recommended_action = "Confirm to buyer that the failed attempt was not settled; no duplicate refund needed."
+                if order_rel == "EXACT_MATCH":
+                    confidence = "HIGH"
+                elif order_rel == "DIFFERENT":
+                    confidence = "LOW"
+                elif order_rel == "POSSIBLE_RETRY_VARIANT" or diff_seconds <= 4 * 3600:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
+                if pair_statuses == {"FAILED"}:
+                    explanation = (
+                        f"Matched {other_pp_id} (FAILED) for {other_amount:.2f} {other_currency} "
+                        f"({time_phrase}). Both payment attempts FAILED; no funds were settled."
+                    )
+                    recommended_action = "No duplicate refund needed because neither payment succeeded."
+                else:
+                    explanation = (
+                        f"Matched {other_pp_id} ({other_status}) for {other_amount:.2f} {other_currency} "
+                        f"({time_phrase}). One payment failed, indicating a customer retry rather than a double capture."
+                    )
+                    recommended_action = (
+                        "Confirm to buyer that the failed attempt was not settled; no duplicate refund needed."
+                    )
             elif "REFUNDED" in pair_statuses:
                 classification = "ALREADY_REFUNDED"
+                if order_rel == "EXACT_MATCH":
+                    confidence = "HIGH"
+                elif order_rel == "DIFFERENT":
+                    confidence = "LOW"
+                elif diff_seconds <= 4 * 3600:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
                 explanation = (
                     f"Matched {other_pp_id} ({other_status}) for {other_amount:.2f} {other_currency} "
                     f"({time_phrase}). A matching payment has already been refunded."
                 )
-                recommended_action = "Share the refund record with the buyer; no additional refund required."
-            else:
-                classification = "POSSIBLE_DUPLICATE"
+                recommended_action = (
+                    "Share the refund record with the buyer; no additional refund required unless both were separate erroneous charges."
+                )
+            elif order_rel == "DIFFERENT":
+                classification = "SEPARATE_ORDERS"
+                confidence = "LOW"
                 explanation = (
                     f"Matched {other_pp_id} ({other_status}) for {other_amount:.2f} {other_currency} "
-                    f"from {target_buyer} ({time_phrase}). Both payments are active/settled."
+                    f"({time_phrase}), but order IDs differ ({target_order_id} vs {other_order_id}), "
+                    "indicating separate orders rather than a duplicate charge."
                 )
                 recommended_action = (
-                    "Verify order fulfillment; if only one order was placed, refund the duplicate capture."
+                    "Retained for review only: confirm both distinct order IDs were fulfilled before considering any refund."
+                )
+            else:
+                classification = "POSSIBLE_DUPLICATE"
+                if order_rel == "EXACT_MATCH":
+                    confidence = "HIGH" if (diff_seconds <= 4 * 3600 or pair_statuses == {"COMPLETED"}) else "MEDIUM"
+                    order_note = f" Both share order ID {target_order_id}."
+                elif order_rel == "POSSIBLE_RETRY_VARIANT":
+                    # Conservative retry heuristic: never promote variant suffixes to HIGH proof
+                    confidence = "MEDIUM" if diff_seconds <= 4 * 3600 else "LOW"
+                    order_note = (
+                        f" Order IDs {target_order_id} and {other_order_id} suggest a possible checkout retry "
+                        "(verify fulfillment before treating as duplicate)."
+                    )
+                else:
+                    # Missing order ID(s): time proximity + description cannot reach HIGH alone
+                    confidence = (
+                        "MEDIUM"
+                        if (diff_seconds <= 4 * 3600 and (desc_rel in {"EXACT_MATCH", "SIMILAR"} or diff_seconds <= 900))
+                        else "LOW"
+                    )
+                    order_note = " Order ID is unavailable on one or both records."
+
+                if "DISPUTED" in pair_statuses:
+                    status_note = (
+                        "One or both payments are currently DISPUTED — check linked dispute state before acting."
+                    )
+                    recommended_action = (
+                        "Review linked dispute evidence/status before initiating any manual refund."
+                    )
+                elif "PENDING" in pair_statuses:
+                    status_note = (
+                        "At least one payment is still PENDING settlement and is not a finalized capture yet."
+                    )
+                    recommended_action = (
+                        "Wait for PENDING payment settlement/cancellation and verify order fulfillment before manually refunding."
+                    )
+                else:
+                    status_note = "Both payments are COMPLETED captures."
+                    recommended_action = (
+                        "Verify order fulfillment and obtain human approval; if only one order was placed, initiate a manual refund on the extra capture."
+                    )
+
+                explanation = (
+                    f"Matched {other_pp_id} ({other_status}) for {other_amount:.2f} {other_currency} "
+                    f"from {target_buyer} ({time_phrase}). {status_note}{order_note}"
                 )
 
             candidates.append(
@@ -368,6 +510,9 @@ class StatusEngine:
                     "matching_fields": matching_fields,
                     "explanation": explanation,
                     "recommended_action": recommended_action,
+                    "order_id": other_order_id,
+                    "description": other_desc,
+                    "order_relationship": order_rel,
                 }
             )
 
@@ -416,7 +561,7 @@ class StatusEngine:
         buyer_email = _get_attr(txn, "buyer_email")
         created_at = _get_attr(txn, "created_at")
         updated_at = _get_attr(txn, "updated_at")
-        order_id = metadata.get("order_id") or metadata.get("paypal_order_id")
+        order_id = extract_order_id(txn)
         error_code = metadata.get("error_code")
         expected_ship = metadata.get("expected_ship")
         pending_reason = metadata.get("pending_reason") or (

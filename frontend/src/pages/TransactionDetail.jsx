@@ -36,6 +36,8 @@ function eventDotColor(eventType) {
     case 'DISPUTE_OPENED':
     case 'DISPUTE_ESCALATED':
       return 'bg-orange-500'
+    case 'DUPLICATE_REVIEWED':
+      return 'bg-indigo-500'
     default:
       return 'bg-[#003087]'
   }
@@ -283,38 +285,95 @@ export default function TransactionDetail() {
               </p>
             ) : (
               <div className="space-y-3">
-                {duplicates.map((dup) => (
-                  <div
-                    key={dup.transaction_id}
-                    className={`rounded-lg border p-4 space-y-2 ${
-                      dup.classification === 'POSSIBLE_DUPLICATE'
-                        ? 'bg-amber-50 border-amber-200'
-                        : 'bg-gray-50 border-gray-200'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between flex-wrap gap-2">
-                      <div className="flex items-center gap-2">
-                        <Link
-                          to={`/transactions/${dup.transaction_id}`}
-                          className="text-sm font-semibold text-[#003087] hover:underline"
-                        >
-                          {dup.paypal_transaction_id}
-                        </Link>
-                        <StatusBadge status={dup.status} />
-                        <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-white border border-gray-300 text-gray-700">
-                          {dup.classification.replace(/_/g, ' ')} • {dup.confidence}
+                {duplicates.map((dup) => {
+                  const reviewDecision = dup.review_decision ?? 'PENDING_REVIEW'
+                  const cardTone =
+                    reviewDecision === 'CONFIRMED_DUPLICATE'
+                      ? 'bg-red-50/60 border-red-200'
+                      : reviewDecision === 'SEPARATE_ORDERS'
+                      ? 'bg-gray-50 border-gray-200'
+                      : dup.classification === 'POSSIBLE_DUPLICATE'
+                      ? 'bg-amber-50 border-amber-200'
+                      : 'bg-gray-50 border-gray-200'
+
+                  const reviewPillTone =
+                    reviewDecision === 'CONFIRMED_DUPLICATE'
+                      ? 'bg-red-100 text-red-800 border-red-300'
+                      : reviewDecision === 'SEPARATE_ORDERS'
+                      ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                      : 'bg-amber-100 text-amber-800 border-amber-300'
+
+                  return (
+                    <div
+                      key={dup.transaction_id}
+                      className={`rounded-lg border p-4 space-y-2.5 ${cardTone}`}
+                    >
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <Link
+                            to={`/transactions/${dup.transaction_id}`}
+                            className="text-sm font-semibold text-[#003087] hover:underline"
+                          >
+                            {dup.paypal_transaction_id}
+                          </Link>
+                          <StatusBadge status={dup.status} />
+                          {dup.role && (
+                            <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-blue-50 border border-blue-200 text-[#003087]">
+                              {dup.role}
+                            </span>
+                          )}
+                          <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-white border border-gray-300 text-gray-700">
+                            {dup.classification.replace(/_/g, ' ')} • {dup.confidence}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-xs font-semibold border ${reviewPillTone}`}
+                          >
+                            {reviewDecision.replace(/_/g, ' ')}
+                          </span>
+                        </div>
+                        <span className="text-sm font-semibold text-gray-900">
+                          {Number(dup.amount).toFixed(2)} {dup.currency}
                         </span>
                       </div>
-                      <span className="text-sm font-semibold text-gray-900">
-                        {Number(dup.amount).toFixed(2)} {dup.currency}
-                      </span>
+
+                      {(dup.order_id || dup.description || dup.order_relationship) && (
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-600">
+                          {dup.order_id && (
+                            <span>
+                              <strong>Order ID:</strong> {dup.order_id}
+                            </span>
+                          )}
+                          {dup.order_relationship && (
+                            <span>
+                              <strong>Order Comparison:</strong>{' '}
+                              {dup.order_relationship.replace(/_/g, ' ')}
+                            </span>
+                          )}
+                          {dup.description && (
+                            <span>
+                              <strong>Description:</strong> {dup.description}
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      <p className="text-sm text-gray-700">{dup.explanation}</p>
+                      <div className="flex items-center justify-between flex-wrap gap-3 pt-1">
+                        <p className="text-xs text-gray-600">
+                          <strong>Action:</strong> {dup.recommended_action}
+                        </p>
+                        <Link
+                          to={`/transactions/${txn.id}/duplicates/${dup.transaction_id}`}
+                          className="btn-secondary text-xs py-1.5 px-3"
+                        >
+                          {reviewDecision === 'PENDING_REVIEW'
+                            ? 'Investigate & Review →'
+                            : 'Inspect / Override Review →'}
+                        </Link>
+                      </div>
                     </div>
-                    <p className="text-sm text-gray-700">{dup.explanation}</p>
-                    <p className="text-xs text-gray-600">
-                      <strong>Action:</strong> {dup.recommended_action}
-                    </p>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>

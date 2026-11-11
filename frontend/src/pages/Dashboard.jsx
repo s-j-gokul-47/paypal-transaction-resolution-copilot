@@ -135,24 +135,45 @@ export default function Dashboard() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {duplicateAlerts.map((alert, idx) => (
               <div
-                key={idx}
+                key={`${alert.primary_id}-${alert.duplicate_id}-${idx}`}
                 className="rounded-lg border border-amber-200 bg-amber-50/50 p-3 flex items-center justify-between gap-3"
               >
-                <div className="text-sm">
-                  <p className="font-semibold text-gray-900">
-                    {alert.primary_paypal_id} &amp; {alert.duplicate_paypal_id}
-                  </p>
-                  <p className="text-gray-600 text-xs mt-0.5">
+                <div className="text-sm space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <p className="font-semibold text-gray-900">
+                      {alert.primary_paypal_id} &amp; {alert.duplicate_paypal_id}
+                    </p>
+                    {alert.review_decision && (
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border ${
+                          alert.review_decision === 'CONFIRMED_DUPLICATE'
+                            ? 'bg-red-100 text-red-800 border-red-200'
+                            : 'bg-amber-100 text-amber-800 border-amber-200'
+                        }`}
+                      >
+                        {alert.review_decision.replace(/_/g, ' ')}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-gray-600 text-xs">
                     {alert.buyer_email} • {Number(alert.amount).toFixed(2)} {alert.currency} •{' '}
                     {Math.max(1, Math.round(alert.time_diff_seconds / 60))} min apart ({alert.confidence} confidence)
                   </p>
                 </div>
-                <Link
-                  to={`/transactions/${alert.duplicate_id}`}
-                  className="text-xs font-semibold text-[#003087] hover:underline flex-shrink-0"
-                >
-                  Inspect →
-                </Link>
+                <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                  <Link
+                    to={`/transactions/${alert.primary_id}/duplicates/${alert.duplicate_id}`}
+                    className="text-xs font-semibold text-[#003087] hover:underline"
+                  >
+                    Investigate Pair →
+                  </Link>
+                  <Link
+                    to={`/transactions/${alert.duplicate_id}`}
+                    className="text-[11px] text-gray-500 hover:text-gray-800 hover:underline"
+                  >
+                    Inspect Txn
+                  </Link>
+                </div>
               </div>
             ))}
           </div>

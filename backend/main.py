@@ -16,7 +16,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from dotenv import load_dotenv
@@ -582,6 +582,15 @@ def _seed_database(db: Session) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    if env in {"production", "prod"}:
+        verify_enabled = os.getenv("PAYPAL_VERIFY_WEBHOOKS", "false").strip().lower() in {"1", "true", "yes", "on"}
+        webhook_id = os.getenv("PAYPAL_WEBHOOK_ID", "").strip()
+        if not verify_enabled or not webhook_id:
+            raise RuntimeError(
+                "CRITICAL SECURITY ERROR: Production deployment detected without PayPal webhook verification enabled "
+                "('PAYPAL_VERIFY_WEBHOOKS=true' and 'PAYPAL_WEBHOOK_ID' are required). Refusing to start in insecure mode."
+            )
     init_db()
     db = SessionLocal()
     try:

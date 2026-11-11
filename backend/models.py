@@ -123,10 +123,12 @@ class ResolutionCase(Base):
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
 
-    id = Column(String, primary_key=True, default=_new_uuid)
+    id = Column(String, primary_key=True)
     event_type = Column(String, nullable=False, index=True)
     payload = Column(JSON, nullable=False)
     verification_status = Column(String, nullable=False, default="unverified")
+    processing_status = Column(String, nullable=False, default="RECEIVED")
+    error_message = Column(Text, nullable=True)
     processed = Column(Boolean, nullable=False, default=False)
     received_at = Column(DateTime, nullable=False, default=_utcnow)
     processed_at = Column(DateTime, nullable=True)

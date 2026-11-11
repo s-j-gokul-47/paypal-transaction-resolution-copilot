@@ -52,9 +52,25 @@ def get_db() -> Generator[Session, None, None]:
 
 def init_db() -> None:
     """
-    Create all tables defined in the SQLAlchemy metadata.
-    Should be called once at application startup.
+    Create all tables defined in the SQLAlchemy metadata and apply lightweight
+    additive column migrations for existing SQLite databases.
     """
-    # Import all models so SQLAlchemy knows about them before creating tables
     import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+
+    # Ensure new columns on webhook_events exist on pre-existing SQLite DBs
+    if DATABASE_URL.startswith("sqlite"):
+        with engine.begin() as conn:
+            cols = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(webhook_events)").fetchall()
+            }
+            if cols:
+                if "processing_status" not in cols:
+                    conn.exec_driver_sql(
+                        "ALTER TABLE webhook_events ADD COLUMN processing_status VARCHAR NOT NULL DEFAULT 'PROCESSED'"
+                    )
+                if "error_message" not in cols:
+                    conn.exec_driver_sql(
+                        "ALTER TABLE webhook_events ADD COLUMN error_message TEXT"
+                    )

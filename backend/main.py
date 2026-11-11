@@ -12,6 +12,7 @@ Secondary workflow:
   - Dispute tracking, evidence submission, AI dispute guidance, and SLA cases
 """
 import json as _json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -39,8 +40,13 @@ from models import (
 )
 from paypal_service import PayPalService, PayPalAPIError
 from ai_service import AIService
-from status_engine import StatusEngine
-from webhook_service import WebhookService
+from status_engine import StatusEngine, get_refund_summary, record_refund_state
+from webhook_service import WebhookService, MalformedWebhookError, WebhookProcessingError
+
+webhook_logger = logging.getLogger("paypal_copilot.webhooks")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logging.getLogger("paypal_copilot").setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -837,9 +843,21 @@ async def refund_transaction(
             detail=f"Only COMPLETED transactions can be refunded directly (current status: {txn.status})",
         )
 
-    refund_amount = payload.amount if payload.amount is not None else txn.amount
-    if refund_amount <= 0 or refund_amount > txn.amount:
+    already_refunded, remaining, _ = get_refund_summary(txn.amount, txn.status, txn.metadata_)
+    if remaining <= 0.005:
+        raise HTTPException(status_code=409, detail="Transaction has no remaining refundable balance")
+
+    refund_amount = round(float(payload.amount), 2) if payload.amount is not None else remaining
+    if refund_amount <= 0:
         raise HTTPException(status_code=422, detail="Invalid refund amount")
+    if refund_amount > remaining + 0.005:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Refund amount {refund_amount:.2f} {txn.currency} exceeds remaining refundable balance "
+                f"({remaining:.2f} {txn.currency}; already refunded: {already_refunded:.2f} {txn.currency})"
+            ),
+        )
 
     try:
         paypal_res = await paypal_service.issue_refund(
@@ -852,25 +870,52 @@ async def refund_transaction(
         raise HTTPException(status_code=e.status_code, detail=e.message)
 
     now = datetime.utcnow()
-    txn.status = "REFUNDED"
+    refund_state = record_refund_state(
+        txn.amount,
+        txn.status,
+        txn.metadata_,
+        refund_id=paypal_res.get("id"),
+        amount=refund_amount,
+        currency=txn.currency,
+        source="mock" if paypal_res.get("is_simulated") else "paypal_api",
+        refund_status=paypal_res.get("status", "COMPLETED"),
+        is_simulated=bool(paypal_res.get("is_simulated")),
+        webhook_confirmed=False,
+    )
+    txn.status = refund_state["new_status"]
     txn.updated_at = now
-    meta = dict(txn.metadata_ or {})
-    meta["refund_id"] = paypal_res.get("id")
-    meta["refund_simulated"] = bool(paypal_res.get("is_simulated"))
-    txn.metadata_ = meta
+    txn.metadata_ = refund_state["metadata"]
+
+    is_partial = refund_state["is_partial"]
+    event_title = (
+        ("Partial refund issued" if is_partial else "Refund issued")
+        + (" (Simulated)" if paypal_res.get("is_simulated") else "")
+    )
+    balance_note = (
+        f" [{refund_state['total_refunded']:.2f}/{txn.amount:.2f} {txn.currency} refunded total]"
+        if is_partial
+        else ""
+    )
 
     db.add(
         TransactionEvent(
             id=str(uuid.uuid4()),
             transaction_id=txn.id,
             event_type="REFUND_ISSUED",
-            title="Refund issued" + (" (Simulated)" if paypal_res.get("is_simulated") else ""),
+            title=event_title,
             description=(
                 f"Refund of {refund_amount:.2f} {txn.currency} recorded "
-                f"(ID: {paypal_res.get('id')}, mode: {paypal_res.get('mode')})."
+                f"(ID: {paypal_res.get('id')}, mode: {paypal_res.get('mode')}).{balance_note}"
             ),
             source="mock" if paypal_res.get("is_simulated") else "paypal_api",
-            details={"paypal_response": paypal_res, "reason": payload.reason},
+            details={
+                "paypal_response": paypal_res,
+                "reason": payload.reason,
+                "refund_amount": refund_amount,
+                "total_refunded": refund_state["total_refunded"],
+                "remaining_refundable": refund_state["remaining_refundable"],
+                "is_partial": is_partial,
+            },
             occurred_at=now,
         )
     )
@@ -1284,15 +1329,13 @@ async def classify_transaction_risk(
 
 @app.post("/api/webhooks/paypal", tags=["Webhooks"])
 async def receive_paypal_webhook(request: Request, db: Session = Depends(get_db)):
-    body = await request.body()
-    try:
-        payload = _json.loads(body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    raw_body = await request.body()
+    webhook_logger.info("webhook_received bytes=%d", len(raw_body))
 
+    # Verify signature against exact raw request bytes BEFORE trusting payload
     is_allowed, verification_status = await webhook_service.verify_webhook_signature(
         headers=dict(request.headers),
-        webhook_event=payload,
+        raw_body=raw_body,
         webhook_id=PAYPAL_WEBHOOK_ID,
         paypal_service=paypal_service,
         verify_webhooks=PAYPAL_VERIFY_WEBHOOKS,
@@ -1303,13 +1346,28 @@ async def receive_paypal_webhook(request: Request, db: Session = Depends(get_db)
             detail=f"Webhook signature verification failed ({verification_status})",
         )
 
-    event_type = payload.get("event_type", "UNKNOWN")
-    result = await webhook_service.process_event(
-        event_type=event_type,
-        payload=payload,
-        db=db,
-        verification_status=verification_status,
-    )
+    # Parse a separate copy for application processing (raw_body remains untouched)
+    try:
+        payload = _json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid UTF-8 JSON payload")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object")
+
+    event_type = payload.get("event_type")
+    try:
+        result = await webhook_service.process_event(
+            event_type=event_type,
+            payload=payload,
+            db=db,
+            verification_status=verification_status,
+        )
+    except MalformedWebhookError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except WebhookProcessingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     return {
         "received": True,
         "verification_status": verification_status,
@@ -1318,15 +1376,186 @@ async def receive_paypal_webhook(request: Request, db: Session = Depends(get_db)
 
 
 # ---------------------------------------------------------------------------
-# PayPal API proxy endpoints
+# PayPal API proxy & Sandbox integration endpoints
 # ---------------------------------------------------------------------------
+
+def _map_paypal_status(pp_status: str) -> str:
+    s = (pp_status or "").upper()
+    if s in {"COMPLETED", "PARTIALLY_REFUNDED"}:
+        return "COMPLETED"
+    if s == "REFUNDED":
+        return "REFUNDED"
+    if s in {"DECLINED", "FAILED"}:
+        return "FAILED"
+    return "PENDING"
+
+
+def _upsert_paypal_capture_in_db(
+    db: Session,
+    capture: dict,
+    order_payload: Optional[dict] = None,
+    description: Optional[str] = None,
+    source: str = "paypal_api",
+) -> Transaction:
+    capture_id = capture.get("id")
+    if not capture_id:
+        raise HTTPException(status_code=502, detail="PayPal response did not include a capture ID")
+
+    amount_obj = capture.get("amount", {})
+    amount = float(amount_obj.get("value", 0) or 0)
+    currency = (amount_obj.get("currency_code") or "USD").upper()
+    raw_status = capture.get("status", "COMPLETED")
+    mapped_status = _map_paypal_status(raw_status)
+    payer_email = (order_payload or {}).get("payer", {}).get("email_address")
+
+    now = datetime.utcnow()
+    txn = db.query(Transaction).filter(Transaction.paypal_transaction_id == capture_id).first()
+    is_new = txn is None
+
+    metadata_payload = {
+        "paypal_raw_status": raw_status,
+        "paypal_order_id": (order_payload or {}).get("id"),
+        "paypal_capture": capture,
+        "is_simulated": bool((order_payload or capture).get("is_simulated")),
+    }
+    if (raw_status or "").upper() == "PARTIALLY_REFUNDED":
+        metadata_payload["partial_refund"] = True
+
+    if is_new:
+        txn = Transaction(
+            id=str(uuid.uuid4()),
+            paypal_transaction_id=capture_id,
+            merchant_id="PAYPAL-SANDBOX" if not paypal_service._mock_mode else "MOCK-MERCHANT",
+            amount=amount,
+            currency=currency,
+            status=mapped_status,
+            description=description or "PayPal Sandbox capture",
+            buyer_email=payer_email,
+            metadata_=metadata_payload,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(txn)
+        db.flush()
+        db.add(
+            TransactionEvent(
+                id=str(uuid.uuid4()),
+                transaction_id=txn.id,
+                event_type="PAYMENT_CAPTURED" if mapped_status == "COMPLETED" else f"PAYMENT_{mapped_status}",
+                title=f"PayPal capture stored ({raw_status})",
+                description=f"Captured {amount:.2f} {currency} via PayPal ({capture.get('mode', paypal_service.environment_label)}).",
+                source=source,
+                details={"capture_id": capture_id, "order_id": (order_payload or {}).get("id")},
+                occurred_at=now,
+            )
+        )
+    else:
+        txn.status = mapped_status
+        txn.amount = amount
+        txn.currency = currency
+        if payer_email:
+            txn.buyer_email = payer_email
+        existing_meta = dict(txn.metadata_ or {})
+        existing_meta.update(metadata_payload)
+        txn.metadata_ = existing_meta
+        txn.updated_at = now
+        db.add(
+            TransactionEvent(
+                id=str(uuid.uuid4()),
+                transaction_id=txn.id,
+                event_type="PAYPAL_SYNCED",
+                title=f"Synced from PayPal API ({raw_status})",
+                description=f"Updated record from PayPal capture {capture_id}.",
+                source=source,
+                details={"capture_id": capture_id},
+                occurred_at=now,
+            )
+        )
+
+    db.commit()
+    db.refresh(txn)
+    return txn
+
+
+@app.post("/api/paypal/orders", tags=["PayPal"])
+async def create_paypal_order(
+    amount: float = Body(19.99, embed=True),
+    currency: str = Body("USD", embed=True),
+    description: str = Body("PayPal Sandbox Test Order", embed=True),
+):
+    try:
+        res = await paypal_service.create_order(
+            amount=amount,
+            currency=currency,
+            description=description,
+        )
+    except PayPalAPIError as e:
+        raise HTTPException(status_code=e.status_code, detail={"message": e.message, "details": e.details})
+
+    approve_url = None
+    for link in res.get("links", []):
+        if link.get("rel") in {"approve", "payer-action"}:
+            approve_url = link.get("href")
+            break
+
+    return {
+        "order_id": res.get("id"),
+        "status": res.get("status"),
+        "approve_url": approve_url,
+        "mode": res.get("mode"),
+        "is_simulated": res.get("is_simulated"),
+        "paypal_response": res,
+    }
+
+
+@app.post("/api/paypal/orders/{order_id}/capture", tags=["PayPal"])
+async def capture_paypal_order(order_id: str, db: Session = Depends(get_db)):
+    try:
+        res = await paypal_service.capture_order(order_id)
+    except PayPalAPIError as e:
+        raise HTTPException(status_code=e.status_code, detail={"message": e.message, "details": e.details})
+
+    purchase_units = res.get("purchase_units") or []
+    captures = (purchase_units[0].get("payments") or {}).get("captures") or [] if purchase_units else []
+    if not captures:
+        raise HTTPException(status_code=502, detail="No capture found in PayPal order capture response")
+
+    capture = dict(captures[0])
+    capture["mode"] = res.get("mode")
+    capture["is_simulated"] = res.get("is_simulated")
+    desc = purchase_units[0].get("description") if purchase_units else None
+    source = "mock" if res.get("is_simulated") else "paypal_api"
+
+    txn = _upsert_paypal_capture_in_db(db, capture=capture, order_payload=res, description=desc, source=source)
+    all_txns = db.query(Transaction).all()
+    return {
+        "transaction": _serialize_transaction(txn, all_txns),
+        "paypal_response": res,
+    }
+
+
+@app.post("/api/paypal/sync/{capture_id}", tags=["PayPal"])
+async def sync_paypal_capture(capture_id: str, db: Session = Depends(get_db)):
+    try:
+        capture = await paypal_service.get_transaction(capture_id)
+    except PayPalAPIError as e:
+        raise HTTPException(status_code=e.status_code, detail={"message": e.message, "details": e.details})
+
+    source = "mock" if capture.get("is_simulated") else "paypal_api"
+    txn = _upsert_paypal_capture_in_db(db, capture=capture, source=source)
+    all_txns = db.query(Transaction).all()
+    return {
+        "transaction": _serialize_transaction(txn, all_txns),
+        "paypal_response": capture,
+    }
+
 
 @app.get("/api/paypal/transactions/{transaction_id}", tags=["PayPal"])
 async def proxy_paypal_transaction(transaction_id: str):
     try:
         return await paypal_service.get_transaction(transaction_id)
     except PayPalAPIError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.message)
+        raise HTTPException(status_code=e.status_code, detail={"message": e.message, "details": e.details})
 
 
 @app.get("/api/paypal/disputes/{dispute_id}", tags=["PayPal"])

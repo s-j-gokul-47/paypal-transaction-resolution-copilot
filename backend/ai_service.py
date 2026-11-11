@@ -182,7 +182,14 @@ def _build_heuristic_support_summary(
         if order_id:
             lines.append(f"- Order Reference: {order_id}")
         if status == "COMPLETED":
-            lines.append("- Details: Your payment has been captured and settled.")
+            total_refunded = float(metadata.get("total_refunded") or 0.0)
+            if metadata.get("partial_refund") and total_refunded > 0:
+                lines.append(
+                    f"- Details: Your payment was captured, and a partial refund of "
+                    f"{total_refunded:.2f} {currency} has been processed."
+                )
+            else:
+                lines.append("- Details: Your payment has been captured and settled.")
         elif status == "PENDING":
             lines.append("- Details: Your payment is currently pending final settlement/clearing.")
         elif status == "FAILED":
@@ -248,6 +255,11 @@ def _build_heuristic_support_summary(
     ]
     if order_id:
         lines.append(f"- Order ID: {order_id}")
+    if metadata.get("partial_refund") and float(metadata.get("total_refunded") or 0.0) > 0:
+        lines.append(
+            f"- Partial Refund Recorded: {float(metadata.get('total_refunded') or 0.0):.2f} {currency} "
+            f"(remaining refundable: {float(metadata.get('remaining_refundable') or 0.0):.2f} {currency})"
+        )
     if error_code:
         lines.append(f"- Processor Error Code: {error_code}")
     if timeline_events:

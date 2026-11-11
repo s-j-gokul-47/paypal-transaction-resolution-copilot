@@ -88,6 +88,167 @@ def _get_attr(obj, key: str, default=None):
     return getattr(obj, key, default)
 
 
+# Allowed capture/webhook status transitions to prevent out-of-order overwrites.
+# Keys are current persisted status; values are statuses a capture/dispute webhook
+# may transition to (excluding explicit merchant dispute-win resolution).
+_ALLOWED_CAPTURE_TRANSITIONS: dict[str, set[str]] = {
+    "PENDING": {"PENDING", "COMPLETED", "FAILED", "DISPUTED", "REFUNDED"},
+    "COMPLETED": {"COMPLETED", "DISPUTED", "REFUNDED"},
+    "DISPUTED": {"DISPUTED", "REFUNDED"},
+    "FAILED": {"FAILED", "DISPUTED", "REFUNDED"},
+    "REFUNDED": {"REFUNDED"},
+}
+
+
+def is_valid_webhook_status_transition(current_status: str, target_status: str) -> bool:
+    """Return True if transitioning `current_status` -> `target_status` via capture/dispute webhook is monotonic."""
+    curr = (current_status or "PENDING").upper()
+    tgt = (target_status or "PENDING").upper()
+    return tgt in _ALLOWED_CAPTURE_TRANSITIONS.get(curr, {tgt})
+
+
+def get_refund_summary(
+    txn_amount: float,
+    txn_status: str,
+    metadata: Optional[dict],
+) -> tuple[float, float, list[dict]]:
+    """Compute `(total_refunded, remaining_refundable, refund_entries)` from verified metadata."""
+    meta = dict(metadata or {})
+    entries = [dict(r) for r in (meta.get("refunds") or []) if isinstance(r, dict)]
+    if entries:
+        summed = sum(
+            float(r.get("amount") or 0)
+            for r in entries
+            if (r.get("status") or "COMPLETED").upper() not in {"FAILED", "CANCELLED"}
+        )
+        recorded_total = float(meta.get("total_refunded") or 0.0)
+        total_refunded = max(summed, recorded_total)
+    elif (txn_status or "").upper() == "REFUNDED":
+        total_refunded = float(txn_amount or 0.0)
+    else:
+        total_refunded = float(meta.get("total_refunded") or 0.0)
+
+    total_refunded = round(min(max(0.0, total_refunded), float(txn_amount or 0.0)), 2)
+    remaining = round(max(0.0, float(txn_amount or 0.0) - total_refunded), 2)
+    return total_refunded, remaining, entries
+
+
+def record_refund_state(
+    txn_amount: float,
+    txn_status: str,
+    metadata: Optional[dict],
+    *,
+    refund_id: Optional[str],
+    amount: Optional[float],
+    currency: str,
+    source: str,
+    refund_status: str = "COMPLETED",
+    paypal_total_refunded: Optional[float] = None,
+    is_simulated: bool = False,
+    webhook_confirmed: bool = False,
+    is_reversal: bool = False,
+) -> dict:
+    """
+    Reconcile partial/full refund or capture reversal state idempotently across API and webhook paths.
+
+    Deduplicates repeated webhook deliveries by `refund_id` even across distinct PayPal event IDs,
+    avoids double-counting API-initiated refunds when confirmed by webhook, and keeps `status`
+    at `COMPLETED`/`DISPUTED` until cumulative refunded amount covers the full transaction.
+    """
+    meta = dict(metadata or {})
+    curr_status = (txn_status or "COMPLETED").upper()
+    norm_refund_status = (refund_status or "COMPLETED").upper()
+    total_before, _, entries = get_refund_summary(txn_amount, curr_status, meta)
+
+    clean_refund_id = (refund_id or "").strip() or None
+    refund_amt = round(float(amount), 2) if amount is not None else round(float(txn_amount or 0.0), 2)
+
+    existing_idx = next(
+        (i for i, e in enumerate(entries) if clean_refund_id and e.get("refund_id") == clean_refund_id),
+        None,
+    )
+
+    if existing_idx is not None:
+        existing = entries[existing_idx]
+        if (
+            webhook_confirmed
+            and existing.get("webhook_confirmed")
+            and (existing.get("status") or "").upper() == norm_refund_status
+        ):
+            remaining = round(max(0.0, float(txn_amount or 0.0) - total_before), 2)
+            return {
+                "action": "duplicate_ignored",
+                "new_status": curr_status,
+                "metadata": meta,
+                "total_refunded": total_before,
+                "remaining_refundable": remaining,
+                "is_partial": 0 < total_before < float(txn_amount or 0.0) - 0.005,
+                "refund_amount": float(existing.get("amount") or refund_amt),
+            }
+
+        existing["status"] = norm_refund_status
+        if webhook_confirmed:
+            existing["webhook_confirmed"] = True
+        if amount is not None:
+            existing["amount"] = refund_amt
+        action = "confirmed" if webhook_confirmed else "recorded"
+    else:
+        entries.append(
+            {
+                "refund_id": clean_refund_id or f"REVERSAL-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                "amount": refund_amt,
+                "currency": (currency or "USD").upper(),
+                "status": norm_refund_status,
+                "source": source,
+                "webhook_confirmed": webhook_confirmed,
+                "is_reversal": is_reversal,
+                "recorded_at": datetime.utcnow().isoformat() + "Z",
+            }
+        )
+        action = "recorded"
+
+    summed = sum(
+        float(r.get("amount") or 0)
+        for r in entries
+        if (r.get("status") or "COMPLETED").upper() not in {"FAILED", "CANCELLED"}
+    )
+    if paypal_total_refunded is not None:
+        total_refunded = round(max(summed, float(paypal_total_refunded)), 2)
+    else:
+        total_refunded = round(summed, 2)
+    total_refunded = round(min(total_refunded, float(txn_amount or 0.0)), 2)
+    remaining = round(max(0.0, float(txn_amount or 0.0) - total_refunded), 2)
+
+    is_pending_refund = norm_refund_status == "PENDING"
+    fully_refunded = is_reversal or (
+        not is_pending_refund and total_refunded >= float(txn_amount or 0.0) - 0.005
+    )
+    is_partial = (not fully_refunded) and total_refunded > 0
+
+    if curr_status == "REFUNDED" or fully_refunded:
+        new_status = "REFUNDED"
+    else:
+        new_status = curr_status
+
+    meta["refunds"] = entries
+    if clean_refund_id:
+        meta["refund_id"] = clean_refund_id
+    meta["refund_simulated"] = bool(meta.get("refund_simulated") or is_simulated)
+    meta["total_refunded"] = total_refunded
+    meta["remaining_refundable"] = remaining
+    meta["partial_refund"] = is_partial
+
+    return {
+        "action": action,
+        "new_status": new_status,
+        "metadata": meta,
+        "total_refunded": total_refunded,
+        "remaining_refundable": remaining,
+        "is_partial": is_partial,
+        "refund_amount": refund_amt,
+    }
+
+
 class StatusEngine:
     """
     Core transaction-resolution engine and secondary dispute SLA engine.
@@ -257,17 +418,33 @@ class StatusEngine:
         active_dups = [d for d in duplicate_candidates if d["classification"] == "POSSIBLE_DUPLICATE"]
 
         if status == "COMPLETED":
-            headline = "Payment captured and settled"
-            summary = (
-                f"Transaction {pp_id} for {amount:.2f} {currency} is recorded as COMPLETED"
-                + (f" for order {order_id}." if order_id else ".")
-                + " Funds were captured."
-            )
-            causes = ["Authorization and capture completed normally."]
-            actions = [
-                "No payment recovery needed unless buyer reports an issue.",
-                "Issue a refund from this screen if order cancellation or duplicate charge is confirmed.",
-            ]
+            partial_refund = bool(metadata.get("partial_refund"))
+            total_refunded = float(metadata.get("total_refunded") or 0.0)
+            remaining = float(metadata.get("remaining_refundable") or max(0.0, amount - total_refunded))
+            if partial_refund and total_refunded > 0:
+                headline = "Payment captured with partial refund recorded"
+                summary = (
+                    f"Transaction {pp_id} for {amount:.2f} {currency} is COMPLETED with "
+                    f"{total_refunded:.2f} {currency} partially refunded "
+                    f"({remaining:.2f} {currency} remaining refundable)."
+                )
+                causes = ["Capture completed and one or more partial refunds were recorded."]
+                actions = [
+                    f"Only up to {remaining:.2f} {currency} remains refundable on this capture.",
+                    "Review timeline events for confirmed partial refund IDs before issuing another refund.",
+                ]
+            else:
+                headline = "Payment captured and settled"
+                summary = (
+                    f"Transaction {pp_id} for {amount:.2f} {currency} is recorded as COMPLETED"
+                    + (f" for order {order_id}." if order_id else ".")
+                    + " Funds were captured."
+                )
+                causes = ["Authorization and capture completed normally."]
+                actions = [
+                    "No payment recovery needed unless buyer reports an issue.",
+                    "Issue a refund from this screen if order cancellation or duplicate charge is confirmed.",
+                ]
         elif status == "PENDING":
             headline = "Payment is pending settlement or release"
             summary = (

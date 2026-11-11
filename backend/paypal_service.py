@@ -9,6 +9,7 @@ unverified records for unknown IDs.
 """
 import base64
 import hashlib
+import json
 import time
 from datetime import datetime
 from typing import Optional
@@ -169,16 +170,51 @@ class PayPalService:
             )
         return self._tag_response(response.json(), simulated=False)
 
-    async def _post(self, path: str, body: dict = None, params: dict = None) -> dict:
+    async def _post(
+        self,
+        path: str,
+        body: dict = None,
+        params: dict = None,
+        extra_headers: dict = None,
+    ) -> dict:
         if self._mock_mode:
             raise NotImplementedError("Call the specific mock method instead")
         headers = await self._auth_headers()
+        if extra_headers:
+            headers.update(extra_headers)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 f"{self.base_url}{path}",
                 headers=headers,
                 json=body or {},
                 params=params,
+            )
+        if response.status_code >= 400:
+            raise PayPalAPIError(
+                f"PayPal POST {path} failed",
+                status_code=response.status_code,
+                details=response.json() if response.content else {},
+            )
+        raw = response.json() if response.content else {"status": "success"}
+        return self._tag_response(raw, simulated=False)
+
+    async def _post_raw_json(
+        self,
+        path: str,
+        raw_json_bytes: bytes,
+        extra_headers: dict = None,
+    ) -> dict:
+        """Send raw UTF-8 JSON bytes directly without dict re-serialization."""
+        if self._mock_mode:
+            raise NotImplementedError("Call the specific mock method instead")
+        headers = await self._auth_headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.base_url}{path}",
+                headers=headers,
+                content=raw_json_bytes,
             )
         if response.status_code >= 400:
             raise PayPalAPIError(
@@ -196,12 +232,13 @@ class PayPalService:
     async def verify_webhook_signature(
         self,
         headers: dict,
-        webhook_event: dict,
+        raw_body: bytes,
         webhook_id: str,
     ) -> dict:
         """
         Verify a PayPal webhook via PayPal's official
-        `POST /v1/notifications/verify-webhook-signature` endpoint.
+        `POST /v1/notifications/verify-webhook-signature` endpoint while
+        preserving the exact raw request JSON bytes verbatim as `webhook_event`.
         """
         normalised = {k.upper(): v for k, v in headers.items()}
         required_headers = [
@@ -228,16 +265,122 @@ class PayPalService:
                 "is_simulated": True,
             }
 
+        if not isinstance(raw_body, (bytes, bytearray)):
+            raise ValueError("raw_body must be bytes to preserve exact webhook payload")
+
+        try:
+            raw_text = bytes(raw_body).decode("utf-8")
+            parsed_check = json.loads(raw_text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PayPalAPIError("Invalid UTF-8 JSON webhook body", status_code=400) from exc
+
+        if not isinstance(parsed_check, dict):
+            raise PayPalAPIError("Webhook body must be a JSON object", status_code=400)
+
+        prefix = json.dumps(
+            {
+                "auth_algo": normalised["PAYPAL-AUTH-ALGO"],
+                "cert_url": normalised["PAYPAL-CERT-URL"],
+                "transmission_id": normalised["PAYPAL-TRANSMISSION-ID"],
+                "transmission_sig": normalised["PAYPAL-TRANSMISSION-SIG"],
+                "transmission_time": normalised["PAYPAL-TRANSMISSION-TIME"],
+                "webhook_id": webhook_id,
+            }
+        )[:-1]
+        verify_payload_bytes = f'{prefix}, "webhook_event": {raw_text}}}'.encode("utf-8")
+
+        return await self._post_raw_json(
+            "/v1/notifications/verify-webhook-signature",
+            raw_json_bytes=verify_payload_bytes,
+        )
+
+    # ------------------------------------------------------------------
+    # Orders v2 (Create & Capture Sandbox/Live Transactions)
+    # ------------------------------------------------------------------
+
+    async def create_order(
+        self,
+        amount: float,
+        currency: str = "USD",
+        description: str = "PayPal Transaction Resolution Copilot Order",
+        return_url: str = "http://localhost:5173/transactions",
+        cancel_url: str = "http://localhost:5173/transactions",
+    ) -> dict:
+        """Create a PayPal Orders v2 checkout order and return its approval link."""
+        if self._mock_mode:
+            order_id = f"ORD-MOCK-{hashlib.md5(f'{amount}:{description}:{time.time()}'.encode()).hexdigest()[:10].upper()}"
+            return self._tag_response(
+                {
+                    "id": order_id,
+                    "status": "CREATED",
+                    "links": [
+                        {"rel": "approve", "href": return_url, "method": "GET"}
+                    ],
+                },
+                simulated=True,
+            )
+
         body = {
-            "auth_algo": normalised["PAYPAL-AUTH-ALGO"],
-            "cert_url": normalised["PAYPAL-CERT-URL"],
-            "transmission_id": normalised["PAYPAL-TRANSMISSION-ID"],
-            "transmission_sig": normalised["PAYPAL-TRANSMISSION-SIG"],
-            "transmission_time": normalised["PAYPAL-TRANSMISSION-TIME"],
-            "webhook_id": webhook_id,
-            "webhook_event": webhook_event,
+            "intent": "CAPTURE",
+            "purchase_units": [
+                {
+                    "description": description,
+                    "amount": {
+                        "currency_code": currency.upper(),
+                        "value": f"{amount:.2f}",
+                    },
+                }
+            ],
+            "application_context": {
+                "return_url": return_url,
+                "cancel_url": cancel_url,
+                "user_action": "PAY_NOW",
+            },
         }
-        return await self._post("/v1/notifications/verify-webhook-signature", body=body)
+        return await self._post(
+            "/v2/checkout/orders",
+            body=body,
+            extra_headers={"Prefer": "return=representation"},
+        )
+
+    async def get_order(self, order_id: str) -> dict:
+        """Retrieve an Orders v2 order by ID."""
+        if self._mock_mode:
+            raise PayPalAPIError("Mock order lookup is not backed by PayPal API", status_code=404)
+        return await self._get(f"/v2/checkout/orders/{order_id}")
+
+    async def capture_order(self, order_id: str) -> dict:
+        """Capture an approved PayPal Orders v2 order."""
+        if self._mock_mode:
+            cap_id = f"CAP-MOCK-{hashlib.md5(order_id.encode()).hexdigest()[:10].upper()}"
+            return self._tag_response(
+                {
+                    "id": order_id,
+                    "status": "COMPLETED",
+                    "payer": {"email_address": "mock.buyer@example.com"},
+                    "purchase_units": [
+                        {
+                            "payments": {
+                                "captures": [
+                                    {
+                                        "id": cap_id,
+                                        "status": "COMPLETED",
+                                        "amount": {"currency_code": "USD", "value": "19.99"},
+                                        "create_time": datetime.utcnow().isoformat() + "Z",
+                                        "update_time": datetime.utcnow().isoformat() + "Z",
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                },
+                simulated=True,
+            )
+        return await self._post(
+            f"/v2/checkout/orders/{order_id}/capture",
+            body={},
+            extra_headers={"Prefer": "return=representation"},
+        )
 
     # ------------------------------------------------------------------
     # Transactions
